@@ -1,0 +1,210 @@
+ePost CLI v1 — public API implementation and test brief
+Prepared 2026-10-11 for a Codex Cloud worker
+Repository: https://github.com/corvaglia-io/epost-cli
+
+Build an unofficial Rust CLI from public documentation only. This brief does not
+contain account data, credentials, private PoC evidence, or implementation code.
+Deliver auth, explicit private/business tenant selection, inbox listing, letter
+metadata/content retrieval, archive folder enumeration and archive retrieval.
+Mail operations are read-only. Do not implement sending, accepting/rejecting
+registered mail, marking read, uploading, moving, restoring or deleting mail.
+
+Official sources
+[1] Full schema: https://api.epost.ch/openapi?query=All
+    Production Swagger: https://api.epost.ch/docs
+[2] Private auth guide:
+    https://developer.epost.ch/docs/api-docs/v6nqmmjkxcery-how-to-access-the-letterbox-public-ap-is-with-a-private-tenant
+[3] Tenants:
+    https://developer.epost.ch/docs/api-docs/c928208791020-returns-all-tenants-of-a-user
+[4] Token:
+    https://developer.epost.ch/docs/api-docs/25cb5b37a5259-generate-tokens-to-access-other-klara-core-endpoints
+[5] Inbox:
+    https://developer.epost.ch/docs/api-docs/f52fd27fd878a-get-letters-of-current-user
+[6] Content:
+    https://developer.epost.ch/docs/api-docs/f3d6c00359743-get-the-content-of-a-letter-with-given-id
+[7] Folders:
+    https://developer.epost.ch/docs/api-docs/048e72f82314c-get-all-folders-branded-folders-unbranded-folders-and-subfolders-in-the-storage
+[8] Archive letters:
+    https://developer.epost.ch/docs/api-docs/c0ca4f1606215-get-letters-in-root-storage-or-in-a-specific-folder
+[9] Test onboarding:
+    https://developer.epost.ch/docs/api-docs/z6ydxfa37ns58-how-to-get-started-on-our-test-environment
+    Test Swagger: https://api-test.klara-epost.tech/docs
+    Test-company verification support:
+    https://support.epost.ch/hc/de/articles/28068217619100-Wie-kann-ich-mein-Unternehmen-in-der-ePost-Testumgebung-verifizieren
+
+Authentication and tenant contract [1–4]
+- Private onboarding is user-handled: onboard in the ePost mobile app, sign in
+  to app.epost.ch with SwissID, then visit
+  https://login.epost.ch/auth/realms/klara/account/ in the same browser and use
+  Authentication to set/update the separate ePost/KLARA password. API username
+  is the account email; API password is that ePost/KLARA password. Do not ask for
+  the SwissID password or automate browser onboarding/password changes.
+- POST /core/latest/tenants, application/x-www-form-urlencoded, accepts either
+  username + password OR access_token. 200 is an array of Tenant objects:
+  tenant_id:string, company_id:int64, company_name:string. Do not choose the
+  first tenant. There is no private/business discriminator in this schema;
+  require explicit tenant kind and tenant/company IDs. Do not classify by name.
+- POST /core/latest/token uses the same form content type. Password grant sends
+  grant_type=password, username, password, tenant_id and company_id. company_id
+  is a string in this request despite int64 in the Tenant response.
+- Refresh sends grant_type=refresh_token + refresh_token. The response field
+  is camelCase refreshToken, not refresh_token. PublicAPIToken also contains
+  access_token:string, expires_in:int64 seconds, refresh_expires_in:int64
+  seconds and token_type:string. Validate tokens/expiry before use; tolerate
+  unknown additional fields. Store receipt time locally for expiry calculation.
+- The token is scoped to one tenant. Bind cached tokens to profile, tenant kind,
+  tenant ID, company ID and API origin; never reuse after selecting another
+  tenant. Redact credentials from Debug/logging/errors. Password/token input
+  belongs in a prompt, stdin or explicitly documented environment variables,
+  never command-line password arguments. Never persist the account password.
+- ePost operations declare X-API-KEY OR Bearer authentication. Bearer is the
+  supported baseline for private login; no private API-key entitlement is
+  established here. Do not require an API key alongside a bearer token.
+- Generic-token, Microsoft exchange and COSSA token exchange are documented
+  alternatives, but need not be implemented for this password/refresh v1.
+
+Exact retrieval contract [1,5–8]
+- GET /epost/v2/letters returns 200 JSON Letter[]. Send letter-folder=INBOX_FOLDER
+  and is-business-tenant=true/false from the explicit selected tenant kind.
+  letter-types is a REQUIRED array query parameter. The six documented values
+  are CLASSIC_LETTER, SMART_LETTER, SMART_LETTER_ANSWER, SIMPLE_SHORT_MESSAGE,
+  INCAMAIL and SECURESEND. Request all six by default or clearly label a narrower
+  filter. OpenAPI's default query array serialization is form/explode=true:
+  repeat letter-types=VALUE for each value; test the exact encoding.
+  limit:int32 is 1..1000, default 48; offset:int32 is >=0, default 0.
+  read-status is READ|UNREAD|ALL, default ALL. Optional from-date/to-date are
+  yyyy-MM-dd and both must be supplied for a date range. Other documented
+  filters are senderCaseId, senderEndToEndId, senderParticipantId, senderUserId
+  and with-reminder; these may remain outside v1 CLI options.
+- GET /epost/v2/letters/{letter-id} returns one 200 JSON Letter. letter-id is
+  an opaque string, not an integer. Encode it as one path segment.
+- GET /epost/v2/letters/{letter-id}/content retrieves content for inbox and
+  archived Letter IDs. The 200 schema has a malformed/ambiguous combined media
+  key "application/octet-stream, application/json" and object/byte schema.
+  Do not infer a PDF-only or base64 contract. Check HTTP status first; preserve
+  successful response bytes, including JSON, with explicit output path and
+  reported Content-Type. Stream into a temporary file and atomically finalize;
+  no overwrite without an explicit option, no partial file presented as success.
+  Do not auto-accept/reject registered mail if content access fails. The docs do
+  not establish content availability before acceptance for every letter type.
+- GET /epost/v2/archives/directories returns 200 JSON Directory[] containing
+  branded, unbranded and subfolders in one call, without pagination parameters.
+  Directory fields: directoryId:string (empty for branded directories),
+  directoryName:string, numberOfDocuments:int32, parentDirectoryIds:string[]
+  (empty for root-level folders), hasSubDirectories:bool. Display the flat list
+  as the baseline. A hierarchy may have multiple parents; avoid assuming a
+  single parent or recursing without cycle protection. Branded empty IDs have
+  no documented distinct selector: do not turn an empty branded ID into root.
+- GET /epost/v2/archives/letters returns 200 JSON Letter[]. Omit directory-id
+  to select root storage; otherwise send its opaque string ID. limit/offset
+  use the same ranges/defaults as inbox. No separate archive-content endpoint
+  is documented; reuse the letter content endpoint above.
+- Lists have no envelope, cursor, total or snapshot identifier. Provide explicit
+  page controls; an optional --all walks offsets until a short/empty page with
+  bounds and repeated-page protection. Offset pagination cannot promise a
+  consistent snapshot while mail changes. Inbox/count counts UNREAD letters;
+  do not use it as a total/completeness check. Do not use search's default ALL
+  scope as a replacement for inbox or root-archive listing.
+
+Response modeling and failures [1]
+Letter properties are: id, letterTitle, fileName, senderParticipantId,
+senderUserId, senderCaseId, senderEndToEndId, documentTypes:string[],
+letterContentReference, letterType, receivedDateTime, documentMessage,
+description, readStatus, remainingDayToDelete:int64, registeredStatus:string,
+eLetterRegistered:bool. Other scalar properties are strings. documentMessage
+can carry a short message; do not assume every letter has a downloadable PDF.
+receivedDateTime is documented as a string; an example includes fractional
+seconds and Z. Preserve its original value and accept valid offset timestamps.
+
+No required arrays are declared on Tenant, PublicAPIToken, Letter or Directory.
+Use tolerant wire models for missing/unknown fields, but fail with a clear error
+when a requested action requires an absent ID/token. Preserve unknown output
+enum values rather than failing a whole list on a new provider value.
+
+Most letter endpoints document 401/403/404/429/500 with ErrorMessage:
+uuid, createdTime, code, message and deprecated detail (all strings). Archive
+endpoints list 401/404/500; handle other actual statuses generically too.
+Tenants errors may instead be ErrorResponse {error,error_description}; token
+errors use ErrorMessage. Treat undocumented code values by HTTP status, as the
+schema explicitly directs. Never assume error bodies are JSON; redact/limit
+body diagnostics. Bound timeouts/retries, honor Retry-After when present and
+keep refresh to one controlled attempt, without infinite 401 loops.
+
+Suggested Rust and CLI boundaries (design choices, not provider requirements)
+- Modules: cli (clap), config/profile, auth/secret provider, api transport
+  (reqwest + rustls), tolerant models (serde), inbox/archive services,
+  pagination, download and output/error. Expose a small library for tests and a
+  thin binary. Use tokio; pin an MSRV and commit Cargo.lock for this CLI.
+- Commands: auth tenants; auth login --tenant-kind private|business --tenant-id
+  ID --company-id ID; auth refresh; auth logout (local only); inbox list;
+  letter show ID; letter download ID --output PATH; archive folders;
+  archive list --root|--directory-id ID. A selected explicit profile supplies
+  the tenant kind/IDs to every read command. Support stable --json output.
+- Isolate credential input behind an interface. Use memory/session/environment
+  input for v1 and test with a memory store. Persistent keyring/token storage
+  can remain parked. Keep ordinary profile configuration free of credentials.
+  Never print raw tokens through normal JSON output.
+- Construct content URLs from the configured API origin and encoded ID; do not
+  follow arbitrary letterContentReference hosts. Disable authenticated redirects
+  or reject origin changes. Require HTTPS outside an explicit localhost test
+  transport; do not add an insecure TLS switch.
+- Keep a small exact method/path allowlist. Auth form POSTs are permitted;
+  every mail/archive operation is one of the GETs above. Never call read/accept/
+  reject/archive/delete/restore/upload/delivery endpoints as a side effect.
+
+Essential synthetic integration tests
+Run cargo fmt --check, cargo clippy --all-targets -- -D warnings and cargo test.
+Use a localhost server (e.g. wiremock or axum), invented IDs/tokens/metadata and
+generated byte fixtures. Bind 127.0.0.1/[::1] on ephemeral ports. Isolate config
+and the secret store, clear credential variables in spawned CLI processes and
+never read host keyrings. Default tests must make no non-loopback requests.
+1. Tenant discovery/password grant exact form encoding, including reserved
+   characters; company int64 -> decimal request string; explicit selection
+   with multiple tenants, no matches and absent fields. No silent first tenant.
+2. Private/business profile isolation; exact is-business-tenant booleans; a
+   switch of tenant/origin invalidates token reuse. Private auth docs distinguish
+   the ePost/KLARA password from SwissID; no private API key required.
+3. Exact refreshToken parsing and refresh_token request encoding, expiry and
+   rotation; malformed/missing token, refresh failure and bounded 401 replay.
+4. Inbox repeated array parameters, all six types, INBOX_FOLDER, pagination
+   defaults/ranges, paired date validation and reserved-character filters.
+5. Empty, one-page and multi-page arrays, exact-full-page termination, duplicate
+   or repeated pages, offset overflow and interrupted pagination reporting.
+6. Letter wire decoding with absent optional properties, unknown fields/enums,
+   fractional/offset dates and short-message metadata; missing ID action error.
+7. Folder enumeration: empty list, root, nested, multiple parents, orphan/cyclic
+   metadata and branded empty ID. Root omission and explicit directory encoding
+   must differ; branded empty selection must not fetch root by accident.
+8. Download arbitrary binary/PDF and successful JSON bytes, byte-for-byte;
+   verify archive IDs reuse /letters/{id}/content. Cover incomplete stream,
+   failed HTTP status, malicious supplied filenames, no overwrite and cleanup.
+9. ErrorMessage, ErrorResponse, unknown code, 401/403/404/429/500, HTML error and
+   malformed JSON; credential redaction, bounded timeout/retry and Retry-After.
+10. Reject off-origin content references/redirects, malformed path IDs and
+    non-local HTTP transport. Assert no credentials reach a second origin.
+11. Spawn CLI against mocks to verify JSON/human output, exit status, stderr
+    separation, missing profile errors and local-only logout.
+12. Capture every request and assert the exact method/path allowlist. Registered
+    mail download failures must never trigger accept/reject or marking read.
+
+Optional sandbox tests and public-repo hygiene
+Public docs conflict: the full schema calls production the only customer-facing
+environment and says no sandbox; test Swagger is labeled internal/not for
+customer use, while ePost onboarding/support describe test company setup [9].
+Do not resolve this by trying production credentials. Gate any live test behind
+explicit opt-in, confirmed authorized sandbox access, a verified test origin
+and dedicated test-only credentials. Exclude these tests from normal CI and
+cloud worker secrets. No personal/business production account tests. No test
+onboarding or test-company verification writes belong in this implementation.
+
+Public commits must contain only source, generated synthetic fixtures, tests
+and public-source documentation. Exclude .env, passwords/tokens, credential
+stores, downloads, HTTP captures, private notes, account mail metadata and
+private PoC reports. Use placeholder examples (example.invalid), document
+public source URLs/date and schema ambiguities, label the project unofficial,
+avoid implying ePost endorsement and do not copy provider branding. Choose an
+appropriate license explicitly; do not invent one for the owner. Scan staged
+changes, repository history and CI artifacts for secrets/personal metadata.
+Do not publish a full vendor schema without checking its redistribution terms;
+a documented endpoint subset and links are sufficient. Read-only API usage
+and locally successful tests do not prove production compatibility.

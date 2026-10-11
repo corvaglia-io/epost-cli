@@ -1,0 +1,13 @@
+/target/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+/data/
+/downloads/
+/state/
+/runs/
+/epost.toml
+/epost.local.toml
+.DS_Store
