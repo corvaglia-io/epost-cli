@@ -27,7 +27,13 @@ cargo build --release --locked
 cargo install --path . --locked
 ```
 
-The toolchain and declared minimum Rust version are 1.98.0. Development is verified on macOS; CI is configured to check Linux. No crate, binary release or container image is published. The project uses the [MIT license](LICENSE).
+The toolchain and declared minimum Rust version are 1.98.0. Development is verified on macOS and Linux CI. The project uses the [MIT license](LICENSE).
+
+## Versioned binaries
+
+Release CI builds macOS and Linux archives for x86-64 and ARM64. A tag such as `v0.1.0` must match `Cargo.toml` and point to a commit merged into `main`. After checks and all four builds succeed, the workflow creates a GitHub release containing the archives and `SHA256SUMS`. PR/manual runs build preview artifacts without creating a release. Archives become available when a maintainer pushes a matching version tag after merging the release workflow; source builds remain available.
+
+Choose your platform archive from [GitHub Releases](https://github.com/corvaglia-io/epost-cli/releases), verify its checksum, then extract and run the included binary. Each archive contains `epost-cli`, `README.md` and `LICENSE`. Linux builds use glibc on Ubuntu 22.04 and are not static/Alpine binaries. macOS binaries are unsigned and not notarized. No Windows binary, crate or container image is published. See [release instructions](docs/releases.md) for platform names, verification and maintainer steps.
 
 ## Authentication and mailbox selection
 

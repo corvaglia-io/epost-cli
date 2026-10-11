@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -36,8 +37,9 @@ jobs:
       - name: Test with loopback networking only
         shell: bash
         run: |
-          export RUSTC="$(rustup which rustc)"
-          export RUSTDOC="$(rustup which rustdoc)"
+          RUSTC="$(rustup which rustc)"
+          RUSTDOC="$(rustup which rustdoc)"
+          export RUSTC RUSTDOC
           export CARGO_HOME="$HOME/.cargo"
           sudo --preserve-env=RUSTC,RUSTDOC,CARGO_HOME unshare --net sh -c \
             'ip link set lo up; exec "$1" test --locked --offline' sh "$(rustup which cargo)"

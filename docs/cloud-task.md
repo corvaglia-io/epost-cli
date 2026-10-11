@@ -28,7 +28,7 @@ Cover private/business request selection; token expiry, refresh and rotation; 40
 
 The default suite must work with no provider secrets and may contact localhost only. Provider integration tests, if included, are separate and disabled by default; allow only a confirmed sandbox host and dedicated test credentials. A production URL must be rejected by this test suite, and missing sandbox configuration must never trigger a production fallback. Sandbox access and private-mailbox parity are unverified because official documentation conflicts.
 
-Add minimal GitHub Actions CI with read-only permissions and formatting, clippy and tests. Pin action dependencies appropriately. Commit Cargo.lock for the CLI. Declare a realistic Rust toolchain/MSRV based on what the environment actually supports. Do not add release automation yet.
+Add minimal GitHub Actions CI with read-only permissions and formatting, clippy and tests. Pin action dependencies appropriately. Commit Cargo.lock for the CLI. Declare a realistic Rust toolchain/MSRV based on what the environment actually supports. The maintainer subsequently authorized versioned release CI; see docs/releases.md for its scope and activation.
 
 ## Documentation and handover
 
