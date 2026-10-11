@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
-use reqwest::header::{AUTHORIZATION, HeaderValue, RETRY_AFTER};
+use reqwest::header::{AUTHORIZATION, HeaderValue, LOCATION, RETRY_AFTER};
 use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -456,6 +456,9 @@ impl PaperlessClient {
             if response.status() == StatusCode::OK {
                 return Ok(response);
             }
+            if response.status().is_redirection() {
+                return Err(self.redirect_error(&response));
+            }
             if matches!(response.status().as_u16(), 401 | 403) {
                 return Err(Error::Auth);
             }
@@ -474,10 +477,87 @@ impl PaperlessClient {
 
     async fn post(&self, request: RequestBuilder) -> Result<Response> {
         let response = request.send().await.map_err(|_| Error::Network)?;
+        if response.status().is_redirection() {
+            return Err(self.redirect_error(&response));
+        }
         match response.status().as_u16() {
             200..=202 => Ok(response),
             401 | 403 => Err(Error::Auth),
             status => Err(Error::Http(status)),
+        }
+    }
+
+    fn redirect_error(&self, response: &Response) -> Error {
+        const UNKNOWN: &str = "the redirect was not followed; check the canonical installation URL, reverse proxy and access policy";
+        const CLOUDFLARE_ACCESS: &str = "the redirect appears to require Cloudflare Access; configure authorized machine access or an internal HTTPS installation URL";
+        const SIGN_IN: &str = "the redirect points to a sign-in or authentication route; a browser-login proxy may be blocking token-authenticated API access";
+        const API_ROUTE: &str = "the redirect points to an API route on the same origin; check the canonical installation URL and reverse-proxy routing";
+
+        // Location may contain a credential, document name, signed query or
+        // login state. Inspect it only in memory and return fixed guidance.
+        let target = response
+            .headers()
+            .get(LOCATION)
+            .filter(|value| value.as_bytes().len() <= 2_048)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| {
+                !value.is_empty()
+                    && value.trim() == *value
+                    && !value.chars().any(char::is_control)
+                    && !value.contains('\\')
+            })
+            .and_then(|value| response.url().join(value).ok())
+            .filter(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+            });
+        let guidance = match target {
+            Some(target)
+                if target
+                    .host_str()
+                    .is_some_and(|host| host.ends_with(".cloudflareaccess.com"))
+                    || target.path().starts_with("/cdn-cgi/access/") =>
+            {
+                CLOUDFLARE_ACCESS
+            }
+            Some(target)
+                if target.path_segments().is_some_and(|segments| {
+                    segments.into_iter().any(|segment| {
+                        matches!(
+                            segment.to_ascii_lowercase().as_str(),
+                            "login"
+                                | "signin"
+                                | "sign-in"
+                                | "authenticate"
+                                | "authentication"
+                                | "auth"
+                                | "oauth"
+                                | "oauth2"
+                                | "authorize"
+                                | "authorization"
+                                | "sso"
+                        )
+                    })
+                }) =>
+            {
+                SIGN_IN
+            }
+            Some(target)
+                if target.origin() == self.base_url.origin()
+                    && (target.path().starts_with("/api/")
+                        || target
+                            .path()
+                            .starts_with(&format!("{}api/", self.base_url.path()))) =>
+            {
+                API_ROUTE
+            }
+            _ => UNKNOWN,
+        };
+        Error::PaperlessRedirect {
+            status: response.status().as_u16(),
+            guidance,
         }
     }
 

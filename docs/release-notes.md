@@ -11,6 +11,7 @@ Development release of the unofficial epost-cli Rust CLI and library.
 - Archive folder observations identify unsupported selectors; explicitly empty folders without subfolders are informational, with coverage still unverified.
 - Profile login updates and local password forgetting without repeating mailbox setup.
 - Optional Paperless-ngx setup and PDF delivery, with separate runtime/Keychain token input, inbox/source tags, ingestion progress, resumable tasks, original-byte verification and checked reconciliation. `sync --paperless` adds delivery without changing ePost mail. Live Paperless compatibility remains unverified.
+- Paperless redirects produce redacted access/routing guidance and stop a delivery batch before attempting further documents; redirect URLs and query values are never logged or followed.
 
 - Read-only inbox and archive metadata/document retrieval.
 - Explicit private/business mailbox selection, password/bearer authentication and business API keys.

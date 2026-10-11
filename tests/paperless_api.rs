@@ -368,7 +368,7 @@ async fn upload_redirects_never_send_documents_or_tokens_to_another_origin() {
         client(&server)
             .upload_pdf("synthetic.pdf", PDF.into(), &[1])
             .await,
-        Err(Error::Http(307))
+        Err(Error::PaperlessRedirect { status: 307, .. })
     ));
     assert!(trap.received_requests().await.unwrap().is_empty());
 }
@@ -624,11 +624,148 @@ async fn redirects_are_not_followed_and_error_bodies_are_redacted() {
         .mount(&server)
         .await;
     let error = client(&server).original(1).await.unwrap_err();
-    assert!(matches!(error, Error::Http(302)));
+    assert!(matches!(
+        error,
+        Error::PaperlessRedirect { status: 302, .. }
+    ));
     assert!(!format!("{error:?} {error}").contains("synthetic-token"));
     assert!(!format!("{error:?} {error}").contains("PRIVATE-DOCUMENT-TEXT"));
     assert!(!format!("{error:?} {error}").contains(&server.uri()));
     assert!(trap.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn redirect_diagnostics_use_fixed_redacted_guidance_and_never_retry() {
+    let oversized = format!("/{}", "PRIVATE-TOKEN".repeat(200));
+    for (location, expected) in [
+        (
+            Some("https://synthetic-team.cloudflareaccess.com/resource?state=PRIVATE-TOKEN"),
+            "Cloudflare Access",
+        ),
+        (
+            Some("/cdn-cgi/access/login?token=PRIVATE-TOKEN"),
+            "Cloudflare Access",
+        ),
+        (
+            Some("/accounts/login/?next=PRIVATE-TOKEN"),
+            "browser-login proxy",
+        ),
+        (
+            Some("https://auth.example.invalid/oauth2/authorize?state=PRIVATE-TOKEN"),
+            "browser-login proxy",
+        ),
+        (
+            Some("/api/tags/?secret=PRIVATE-TOKEN"),
+            "API route on the same origin",
+        ),
+        (
+            Some("https://api.example.invalid/api/tags/?secret=PRIVATE-TOKEN"),
+            "access policy",
+        ),
+        (Some("https://[malformed]/PRIVATE-TOKEN"), "access policy"),
+        (Some("javascript:PRIVATE-TOKEN"), "access policy"),
+        (
+            Some("https://PRIVATE-TOKEN@synthetic-team.cloudflareaccess.com/login/"),
+            "access policy",
+        ),
+        (
+            Some("https://cloudflareaccess.com.evil.invalid/resource?state=PRIVATE-TOKEN"),
+            "access policy",
+        ),
+        (
+            Some(
+                "/opaque?returnto=https%3A%2F%2Fsynthetic-team.cloudflareaccess.com%2Fcdn-cgi%2Faccess%2Flogin%3Fstate%3DPRIVATE-TOKEN",
+            ),
+            "access policy",
+        ),
+        (
+            Some(
+                "/accounts/login/?returnto=https%3A%2F%2Fsynthetic-team.cloudflareaccess.com%2Fcdn-cgi%2Faccess%2Flogin%3Fstate%3DPRIVATE-TOKEN",
+            ),
+            "browser-login proxy",
+        ),
+        (
+            Some(
+                "https://api.example.invalid/opaque#https://synthetic-team.cloudflareaccess.com/cdn-cgi/access/login?state=PRIVATE-TOKEN",
+            ),
+            "access policy",
+        ),
+        (Some(oversized.as_str()), "access policy"),
+        (None, "access policy"),
+    ] {
+        let server = MockServer::start().await;
+        let mut response =
+            ResponseTemplate::new(302).set_body_string("PRIVATE-DOCUMENT-TEXT synthetic-token");
+        if let Some(location) = location {
+            response = response.insert_header("Location", location);
+        }
+        Mock::given(method("GET"))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = PaperlessClient::for_test(
+            &server.uri(),
+            Secret::new("synthetic-token".into()),
+            PaperlessOptions {
+                max_retries: 5,
+                ..options()
+            },
+        )
+        .unwrap();
+        let error = client.tags().await.unwrap_err();
+        assert!(matches!(
+            error,
+            Error::PaperlessRedirect { status: 302, .. }
+        ));
+        assert_eq!(error.exit_code(), 1);
+        assert!(error.to_string().contains(expected));
+        for private in [
+            "PRIVATE-TOKEN",
+            "PRIVATE-DOCUMENT-TEXT",
+            "synthetic-token",
+            "synthetic-team",
+            "auth.example.invalid",
+            "api.example.invalid",
+            "evil.invalid",
+            &server.uri(),
+        ] {
+            assert!(!format!("{error:?} {error}").contains(private));
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn installation_api_redirect_and_tag_post_have_meaningful_guidance() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/installation/api/tags/"))
+        .respond_with(
+            ResponseTemplate::new(308)
+                .insert_header("Location", "/installation/api/tags/?token=PRIVATE-TOKEN"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = PaperlessClient::for_test(
+        &format!("{}/installation/", server.uri()),
+        Secret::new("synthetic-token".into()),
+        PaperlessOptions {
+            max_retries: 5,
+            ..options()
+        },
+    )
+    .unwrap();
+    let error = client.create_tag("Inbox", true).await.unwrap_err();
+    assert!(matches!(
+        error,
+        Error::PaperlessRedirect { status: 308, .. }
+    ));
+    assert!(error.to_string().contains("canonical installation URL"));
+    assert!(error.to_string().contains("API route on the same origin"));
+    assert!(!format!("{error:?} {error}").contains("PRIVATE-TOKEN"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]

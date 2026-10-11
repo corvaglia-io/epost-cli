@@ -460,6 +460,102 @@ async fn authentication_failure_stops_batch_and_preserves_partial_report() {
 }
 
 #[tokio::test]
+async fn upload_redirect_stops_batch_and_preserves_only_one_uncertain_intent() {
+    let server = MockServer::start().await;
+    let redirect_destination = MockServer::start().await;
+    let location = format!(
+        "{}/login/?token=fake-redirect-query",
+        redirect_destination.uri()
+    );
+    Mock::given(method("POST"))
+        .and(path("/api/documents/post_document/"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", location.as_str()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fixture = Fixture::new();
+    let mut store = seeded(&fixture);
+    store
+        .save("second-synthetic-letter", "inbox", &pdf(), None)
+        .unwrap();
+    let client = make_client(&server);
+    let target = make_target(&client);
+    let report = deliver(&mut store, &client, &target, options(), |_| {})
+        .await
+        .unwrap();
+    assert!(report.access_blocked);
+    assert!(!report.authentication_failed);
+    assert_eq!(report.uncertain, 1);
+    assert_eq!(report.not_attempted, 1);
+    assert!(report.has_attention());
+    let rendered = serde_json::to_string(&report).unwrap();
+    assert!(!rendered.contains("fake-redirect-query"));
+    assert!(!rendered.contains(&location));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert!(
+        redirect_destination
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(ledger(&store)["entries"].as_object().unwrap().len(), 1);
+    assert_eq!(record(&ledger(&store))["state"]["kind"], "uploading");
+}
+
+#[tokio::test]
+async fn polling_redirect_stops_without_reconciliation_and_keeps_saved_task() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let server = MockServer::start().await;
+    upload(&server, 200).await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let received = attempts.clone();
+    Mock::given(method("GET"))
+        .and(path("/api/tasks/"))
+        .respond_with(move |_request: &Request| {
+            if received.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_json(json!([]))
+            } else {
+                ResponseTemplate::new(302)
+                    .insert_header("Location", "/accounts/login/?next=fake-sensitive-query")
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let fixture = Fixture::new();
+    let mut store = seeded(&fixture);
+    store
+        .save("second-synthetic-letter", "inbox", &pdf(), None)
+        .unwrap();
+    let client = make_client(&server);
+    let target = make_target(&client);
+    let options = DeliveryOptions {
+        poll_attempts: 2,
+        ..options()
+    };
+    let report = deliver(&mut store, &client, &target, options, |_| {})
+        .await
+        .unwrap();
+    assert!(report.access_blocked);
+    assert!(!report.authentication_failed);
+    assert_eq!(report.pending, 1);
+    assert_eq!(report.not_attempted, 1);
+    assert!(report.has_attention());
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    assert_eq!(ledger(&store)["entries"].as_object().unwrap().len(), 1);
+    assert_eq!(record(&ledger(&store))["state"]["kind"], "pending");
+    assert_eq!(record(&ledger(&store))["state"]["task_id"], TASK_ID);
+    assert!(
+        !serde_json::to_string(&report)
+            .unwrap()
+            .contains("fake-sensitive-query")
+    );
+}
+
+#[tokio::test]
 async fn failed_or_interrupted_post_is_uncertain_and_never_blindly_retried() {
     let server = MockServer::start().await;
     upload(&server, 503).await;

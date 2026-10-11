@@ -86,6 +86,8 @@ pub struct DeliveryItem {
     pub error: Option<String>,
     #[serde(skip)]
     authentication_failed: bool,
+    #[serde(skip)]
+    access_blocked: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -99,22 +101,26 @@ pub struct DeliveryReport {
     pub deferred_limit: usize,
     pub not_attempted: usize,
     pub authentication_failed: bool,
+    pub access_blocked: bool,
     pub items: Vec<DeliveryItem>,
 }
 
 impl DeliveryReport {
     pub fn has_attention(&self) -> bool {
-        self.pending
-            + self.uncertain
-            + self.failed
-            + self.unsupported
-            + self.deferred_limit
-            + self.not_attempted
-            != 0
+        self.authentication_failed
+            || self.access_blocked
+            || self.pending
+                + self.uncertain
+                + self.failed
+                + self.unsupported
+                + self.deferred_limit
+                + self.not_attempted
+                != 0
     }
 
     fn add(&mut self, item: DeliveryItem) {
         self.authentication_failed |= item.authentication_failed;
+        self.access_blocked |= item.access_blocked;
         match item.status {
             DeliveryItemStatus::Delivered => self.delivered += 1,
             DeliveryItemStatus::AlreadyDelivered => self.already_delivered += 1,
@@ -267,9 +273,13 @@ pub async fn deliver(
     progress(report.event(DeliveryPhase::Started, documents.len()));
     for document in &documents {
         let reference = document_ref(store, &document.letter_id);
-        if report.authentication_failed {
+        if report.authentication_failed || report.access_blocked {
             report.add(item(&reference, DeliveryItemStatus::NotAttempted, None,
-                Some("delivery stopped after Paperless authentication failed; restore access and run again")));
+                Some(if report.authentication_failed {
+                    "delivery stopped after Paperless authentication failed; restore access and run again"
+                } else {
+                    "delivery stopped after Paperless redirected access; check the installation URL and proxy sign-in, then run again"
+                })));
             continue;
         }
         if document.media_kind != "pdf" {
@@ -480,7 +490,7 @@ pub async fn deliver(
                         }
                     }
                 }
-                if task_missing && !result.authentication_failed {
+                if task_missing && !result.authentication_failed && !result.access_blocked {
                     progress(report.event(DeliveryPhase::Reconciling, documents.len()));
                     result = reconcile_record(
                         store,
@@ -847,6 +857,7 @@ fn item(
         document_id,
         error: error.map(str::to_owned),
         authentication_failed: false,
+        access_blocked: false,
     }
 }
 
@@ -862,5 +873,6 @@ fn item_error(
         document_id,
         error: Some(error.to_string()),
         authentication_failed: matches!(error, Error::Auth | Error::Http(401 | 403)),
+        access_blocked: matches!(error, Error::PaperlessRedirect { .. }),
     }
 }

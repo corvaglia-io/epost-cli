@@ -11,6 +11,8 @@ pub enum Error {
     Auth,
     #[error("provider returned HTTP {0}")]
     Http(u16),
+    #[error("Paperless API redirected (HTTP {status}): {guidance}")]
+    PaperlessRedirect { status: u16, guidance: &'static str },
     #[error("network request failed or timed out")]
     Network,
     #[error("invalid provider response: {0}")]
