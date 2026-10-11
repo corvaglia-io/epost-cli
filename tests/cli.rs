@@ -773,3 +773,524 @@ fn non_loopback_test_transport_is_rejected_without_contacting_a_provider() {
         .unwrap();
     failure_output(&output, 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn content_404_is_diagnosed_with_one_canonical_metadata_check() {
+    let cases = [
+        (
+            200,
+            json!({"id":"invented-unavailable", "letterType":"SIMPLE_SHORT_MESSAGE", "documentMessage":"invented message", "fileName":"invented.pdf", "letterContentReference":"https://untrusted.invalid/must-not-follow"}),
+            "content_unavailable_metadata_available",
+            "failed",
+        ),
+        (
+            404,
+            json!({"message": "fake-private-body"}),
+            "letter_unavailable",
+            "failed",
+        ),
+        (
+            500,
+            json!({"message": "fake-private-body"}),
+            "metadata_check_failed",
+            "failed",
+        ),
+        (
+            200,
+            json!({"id":"invented-wrong-id"}),
+            "metadata_id_mismatch",
+            "failed",
+        ),
+        (
+            200,
+            json!({"letterType":"SMART_LETTER"}),
+            "metadata_id_mismatch",
+            "failed",
+        ),
+        (
+            200,
+            json!({"id":"invented-unavailable", "registeredStatus":"PENDING", "eLetterRegistered":true}),
+            "content_unavailable_metadata_available",
+            "awaiting_manual_acceptance_or_status_verification",
+        ),
+    ];
+    for (metadata_status, metadata, reason, status) in cases {
+        let server = MockServer::start().await;
+        let store = temp_store();
+        inbox(
+            &server,
+            json!([{"id":"invented-unavailable"}, {"id":"invented-good"}]),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/epost/v2/letters/invented-unavailable/content"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(FAKE_TOKEN))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/epost/v2/letters/invented-unavailable"))
+            .respond_with(ResponseTemplate::new(metadata_status).set_body_json(metadata))
+            .expect(1)
+            .mount(&server)
+            .await;
+        content(&server, "invented-good", PDF, "application/pdf", 1).await;
+        let output = selected_command(&server)
+            .args(["sync", "--scope", "inbox", "--output"])
+            .arg(store.path())
+            .output()
+            .unwrap();
+        let payload = successful_output(&output, 2);
+        let failed = &payload["data"]["documents"][0];
+        assert_eq!(failed["status"], status);
+        assert!(failed["document"].is_null());
+        assert_eq!(failed["diagnostic"]["reason_code"], reason);
+        assert_eq!(failed["diagnostic"]["content_http_status"], 404);
+        assert_eq!(
+            failed["diagnostic"]["metadata_http_status"],
+            metadata_status
+        );
+        assert_eq!(payload["data"]["documents"][1]["status"], "saved_pdf");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("fake-private-body"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("untrusted.invalid"));
+        if failed["diagnostic"]["letter_type"] == "SIMPLE_SHORT_MESSAGE" {
+            assert_eq!(failed["diagnostic"]["has_message"], true);
+            assert_eq!(failed["diagnostic"]["has_content_reference"], true);
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_read_only(&requests);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn content_404_metadata_authentication_failure_stops_further_retrieval() {
+    let server = MockServer::start().await;
+    let store = temp_store();
+    inbox(
+        &server,
+        json!([{"id":"invented-unavailable"}, {"id":"invented-deferred"}]),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/epost/v2/letters/invented-unavailable/content"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/epost/v2/letters/invented-unavailable"))
+        .respond_with(ResponseTemplate::new(403).set_body_string(FAKE_TOKEN))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let output = selected_command(&server)
+        .args(["sync", "--scope", "inbox", "--output"])
+        .arg(store.path())
+        .output()
+        .unwrap();
+    let payload = successful_output(&output, 3);
+    assert_eq!(payload["data"]["documents"].as_array().unwrap().len(), 1);
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    assert_read_only(&server.received_requests().await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_404_metadata_is_redacted_and_cannot_hide_future_content() {
+    let server = MockServer::start().await;
+    let store = temp_store();
+    inbox(&server, json!([{"id":"invented-later-content"}])).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    Mock::given(method("GET"))
+        .and(path("/epost/v2/letters/invented-later-content/content"))
+        .respond_with(move |_: &Request| {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(404)
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_bytes(PDF)
+                    .insert_header("content-type", "application/pdf")
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/epost/v2/letters/invented-later-content"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!("malformed {FAKE_TOKEN}")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let output = selected_command(&server)
+        .args(["sync", "--scope", "inbox", "--output"])
+        .arg(store.path())
+        .output()
+        .unwrap();
+    let payload = successful_output(&output, 2);
+    assert_eq!(
+        payload["data"]["documents"][0]["diagnostic"]["reason_code"],
+        "metadata_check_failed"
+    );
+    assert!(payload["data"]["documents"][0]["document"].is_null());
+    let output = selected_command(&server)
+        .args(["sync", "--scope", "inbox", "--output"])
+        .arg(store.path())
+        .output()
+        .unwrap();
+    let payload = successful_output(&output, 0);
+    assert_eq!(payload["data"]["documents"][0]["status"], "saved_pdf");
+    assert_eq!(
+        payload["data"]["documents"][0]["document"]["format_hint"],
+        "pdf"
+    );
+    assert_read_only(&server.received_requests().await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unselectable_archive_observations_only_skip_explicit_empty_leaf_folders() {
+    for (count, children, expected_exit, selection) in [
+        (json!(0), json!(false), 0, "unselectable_empty"),
+        (json!(0), json!(true), 2, "unselectable"),
+        (json!(0), Value::Null, 2, "unselectable"),
+        (json!(1), json!(false), 2, "unselectable"),
+        (json!(-1), json!(false), 2, "unselectable"),
+        (Value::Null, json!(false), 2, "unselectable"),
+    ] {
+        let server = MockServer::start().await;
+        let store = temp_store();
+        let mut observation =
+            json!({"directoryId":"", "directoryName":"invented empty branded folder"});
+        if !count.is_null() {
+            observation["numberOfDocuments"] = count;
+        }
+        if !children.is_null() {
+            observation["hasSubDirectories"] = children;
+        }
+        Mock::given(method("GET"))
+            .and(path("/epost/v2/archives/directories"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                observation, {"directoryId":"invented-selectable", "numberOfDocuments":0}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/epost/v2/archives/letters"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let output = selected_command(&server)
+            .args(["sync", "--scope", "archive", "--output"])
+            .arg(store.path())
+            .output()
+            .unwrap();
+        let payload = successful_output(&output, expected_exit);
+        assert_eq!(payload["data"]["mailbox_coverage_verified"], false);
+        assert_eq!(payload["data"]["pagination_complete"], expected_exit == 0);
+        assert_eq!(
+            payload["data"]["archive_directories"][0]["selection"],
+            selection
+        );
+        assert_eq!(
+            payload["data"]["archive_directories"][0]["directory"]["name"],
+            "invented empty branded folder"
+        );
+        let requests = server.received_requests().await.unwrap();
+        // Even zero-count selectable folders are visited; empty IDs never become
+        // an extra root request and no undocumented search/folder selector is used.
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r
+                    .url
+                    .query_pairs()
+                    .any(|(k, v)| k == "directory-id" && v == "invented-selectable"))
+                .count(),
+            1
+        );
+        assert_read_only(&requests);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_binary_retains_format_hint_and_partial_status() {
+    let server = MockServer::start().await;
+    let store = temp_store();
+    inbox(&server, json!([{"id":"invented-image"}])).await;
+    content(
+        &server,
+        "invented-image",
+        b"\x89PNG\r\n\x1a\nsynthetic-not-a-valid-image",
+        "application/octet-stream",
+        1,
+    )
+    .await;
+    for status in ["saved_binary", "already_saved"] {
+        let output = selected_command(&server)
+            .args(["--progress", "sync", "--scope", "inbox", "--output"])
+            .arg(store.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let record = &payload["data"]["documents"][0];
+        assert_eq!(record["status"], status);
+        assert_eq!(record["document"]["media_kind"], "binary");
+        assert_eq!(record["document"]["format_hint"], "png");
+        let progress = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(
+            progress
+                .matches("unsupported content preserved locally")
+                .count(),
+            1
+        );
+        assert!(progress.contains("PNG"));
+        assert!(!progress.contains("invented-image"));
+        assert!(!progress.contains(FAKE_TOKEN));
+    }
+    assert_read_only(&server.received_requests().await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_download_content_404_keeps_partial_status_and_diagnostics() {
+    let server = MockServer::start().await;
+    let store = temp_store();
+    Mock::given(method("GET"))
+        .and(path("/epost/v2/letters/invented-direct"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id":"invented-direct", "letterType":"SMART_LETTER"
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/epost/v2/letters/invented-direct/content"))
+        .respond_with(ResponseTemplate::new(404).set_body_string(FAKE_TOKEN))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let output = selected_command(&server)
+        .args(["download", "invented-direct", "--output"])
+        .arg(store.path())
+        .output()
+        .unwrap();
+    let payload = successful_output(&output, 2);
+    assert_eq!(payload["data"]["status"], "failed");
+    assert_eq!(
+        payload["data"]["diagnostic"]["reason_code"],
+        "content_unavailable_metadata_available"
+    );
+    assert_eq!(payload["data"]["diagnostic"]["letter_type"], "SMART_LETTER");
+    assert!(payload["data"]["document"].is_null());
+    assert_read_only(&server.received_requests().await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quick_inbox_check_uses_only_unread_count_and_never_downloads() {
+    for unread in [0, 5] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/epost/v2/letters/inbox/count"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(unread))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let output = selected_command(&server)
+            .args(["inbox", "check", "--unread-only"])
+            .output()
+            .unwrap();
+        let payload = successful_output(&output, 0);
+        assert_eq!(payload["data"]["unread_count"], unread);
+        assert_eq!(payload["data"]["has_unread"], unread > 0);
+        assert!(payload["data"]["has_new"].is_null());
+        assert!(payload["data"]["pagination_complete"].is_null());
+        assert_eq!(payload["data"]["sync_performed"], false);
+        assert_eq!(payload["data"]["mailbox_coverage_verified"], false);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_read_only(&server.received_requests().await.unwrap());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbox_check_reports_saved_unread_separately_from_unsaved_read_and_can_sync() {
+    let server = MockServer::start().await;
+    let store = temp_store();
+    inbox(
+        &server,
+        json!([
+            {"id":"invented-unread", "readStatus":"UNREAD"},
+            {"id":"invented-read", "readStatus":"READ"}
+        ]),
+    )
+    .await;
+    content(&server, "invented-unread", PDF, "application/pdf", 1).await;
+    content(&server, "invented-read", PDF, "application/pdf", 1).await;
+    // Seed only the first item using a wholly synthetic document and namespace.
+    Mock::given(method("GET"))
+        .and(path("/epost/v2/letters/invented-unread"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"invented-unread"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let output = selected_command(&server)
+        .args(["download", "invented-unread", "--output"])
+        .arg(store.path())
+        .output()
+        .unwrap();
+    successful_output(&output, 0);
+    let output = selected_command(&server)
+        .args(["inbox", "check", "--output"])
+        .arg(store.path())
+        .output()
+        .unwrap();
+    let payload = successful_output(&output, 0);
+    assert_eq!(payload["data"]["unread_count"], 1);
+    assert_eq!(payload["data"]["new_documents_count"], 1);
+    assert_eq!(payload["data"]["already_saved_count"], 1);
+    assert_eq!(payload["data"]["has_new"], true);
+    assert_eq!(payload["data"]["has_unread"], true);
+    assert_eq!(payload["data"]["sync_performed"], false);
+    let output = selected_command(&server)
+        .args(["inbox", "check", "--sync-if-needed", "--output"])
+        .arg(store.path())
+        .output()
+        .unwrap();
+    let payload = successful_output(&output, 0);
+    assert_eq!(payload["data"]["sync_performed"], true);
+    assert_eq!(payload["data"]["sync"]["scope"], "inbox");
+    assert_eq!(
+        payload["data"]["sync"]["documents"][0]["status"],
+        "already_saved"
+    );
+    assert_eq!(
+        payload["data"]["sync"]["documents"][1]["status"],
+        "saved_pdf"
+    );
+    let output = selected_command(&server)
+        .args(["inbox", "check", "--output"])
+        .arg(store.path())
+        .output()
+        .unwrap();
+    let payload = successful_output(&output, 0);
+    assert_eq!(payload["data"]["has_new"], false);
+    assert_eq!(payload["data"]["has_unread"], true);
+    assert_eq!(payload["data"]["sync_needed"], true);
+    assert_read_only(&server.received_requests().await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbox_check_never_claims_quiet_after_unknown_status_or_incomplete_inventory() {
+    for letters in [
+        json!([{"id":"invented-new", "readStatus":FAKE_TOKEN}]),
+        json!([{"readStatus":"READ"}]),
+    ] {
+        let server = MockServer::start().await;
+        let store = temp_store();
+        inbox(&server, letters).await;
+        let output = selected_command(&server)
+            .args(["inbox", "check", "--output"])
+            .arg(store.path())
+            .output()
+            .unwrap();
+        let payload = successful_output(&output, 2);
+        assert!(payload["data"]["has_unread"].is_null());
+        assert_ne!(payload["data"]["sync_needed"], false);
+        assert_eq!(payload["data"]["sync_performed"], false);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_read_only(&server.received_requests().await.unwrap());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conditional_quick_check_syncs_positive_count_but_skips_zero_without_content_calls() {
+    for unread in [0, 1] {
+        let server = MockServer::start().await;
+        let store = temp_store();
+        Mock::given(method("GET"))
+            .and(path("/epost/v2/letters/inbox/count"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(unread))
+            .expect(1)
+            .mount(&server)
+            .await;
+        if unread > 0 {
+            inbox(
+                &server,
+                json!([{"id":"invented-quick-sync", "readStatus":"UNREAD"}]),
+            )
+            .await;
+            content(&server, "invented-quick-sync", PDF, "application/pdf", 1).await;
+        }
+        let output = selected_command(&server)
+            .args([
+                "inbox",
+                "check",
+                "--unread-only",
+                "--sync-if-needed",
+                "--output",
+            ])
+            .arg(store.path())
+            .output()
+            .unwrap();
+        let payload = successful_output(&output, 0);
+        assert_eq!(payload["data"]["sync_performed"], unread > 0);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            if unread > 0 { 3 } else { 1 }
+        );
+        assert_read_only(&server.received_requests().await.unwrap());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conditional_full_check_skips_read_empty_inbox_and_stops_on_late_auth_failure() {
+    let server = MockServer::start().await;
+    let store = temp_store();
+    inbox(&server, json!([])).await;
+    let output = selected_command(&server)
+        .args(["inbox", "check", "--sync-if-needed", "--output"])
+        .arg(store.path())
+        .output()
+        .unwrap();
+    let payload = successful_output(&output, 0);
+    assert_eq!(payload["data"]["sync_needed"], false);
+    assert_eq!(payload["data"]["sync_performed"], false);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/epost/v2/letters"))
+        .and(query_param("offset", "0"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"id":"invented-new", "readStatus":"UNREAD"}])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/epost/v2/letters"))
+        .and(query_param("offset", "1"))
+        .respond_with(ResponseTemplate::new(403).set_body_string(FAKE_TOKEN))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let output = selected_command(&server)
+        .args([
+            "inbox",
+            "check",
+            "--sync-if-needed",
+            "--page-size",
+            "1",
+            "--output",
+        ])
+        .arg(store.path())
+        .output()
+        .unwrap();
+    let payload = successful_output(&output, 3);
+    assert_eq!(payload["data"]["sync_needed"], true);
+    assert_eq!(payload["data"]["sync_performed"], false);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    assert_read_only(&server.received_requests().await.unwrap());
+}

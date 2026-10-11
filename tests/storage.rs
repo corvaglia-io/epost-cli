@@ -1,6 +1,6 @@
 //! Entirely synthetic local filesystem tests; no provider captures or secrets.
 
-use epost_cli::storage::Store;
+use epost_cli::storage::{SaveResult, Store, format_hint};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -116,6 +116,7 @@ fn repeat_runs_verify_and_record_all_inbox_archive_sources() {
     assert_eq!(third.status, "already_saved");
     for result in [&first, &second, &third] {
         assert_eq!(result.content_type.as_deref(), Some("application/pdf"));
+        assert_eq!(result.format_hint.as_deref(), Some("pdf"));
     }
     let manifest = fixture.read_manifest("synthetic-private");
     let entries = manifest["entries"].as_object().unwrap();
@@ -127,6 +128,30 @@ fn repeat_runs_verify_and_record_all_inbox_archive_sources() {
         serde_json::json!(["archive:folder:invented", "archive:root", "inbox"])
     );
     assert_eq!(fs::read(first.path).unwrap(), bytes);
+}
+
+#[test]
+fn saved_membership_lookup_is_read_only_and_validates_identifiers() {
+    let fixture = Fixture::new();
+    let bytes = pdf();
+    let saved = {
+        let mut store = Store::open(&fixture.root, "scope").unwrap();
+        store
+            .save("invented-saved-id", "inbox", &bytes, None)
+            .unwrap()
+    };
+    let manifest_before = fs::read(fixture.manifest("scope")).unwrap();
+    let store = Store::open(&fixture.root, "scope").unwrap();
+    assert!(store.contains_saved("invented-saved-id").unwrap());
+    assert!(!store.contains_saved("invented-missing-id").unwrap());
+    assert!(store.contains_saved("invented-saved-id").unwrap());
+    assert!(store.contains_saved("").is_err());
+    assert!(store.contains_saved(&"x".repeat(4097)).is_err());
+    assert_eq!(
+        fs::read(fixture.manifest("scope")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(fs::read(saved.path).unwrap(), bytes);
 }
 
 #[test]
@@ -187,8 +212,12 @@ fn detects_corrupt_and_missing_saved_files() {
         } else {
             let mut corrupt = fs::read(&saved.path).unwrap();
             corrupt[20] ^= 1;
+            assert_eq!(format_hint(&corrupt), Some("pdf"));
             fs::write(&saved.path, corrupt).unwrap();
         }
+        // Recorded membership remains a snapshot; content reuse still verifies
+        // the file and rejects modifications made after opening the store.
+        assert!(store.contains_saved("id").unwrap());
         assert!(store.verify_existing("id", "inbox").is_err());
         drop(store);
         assert!(Store::open(&fixture.root, "scope").is_err());
@@ -201,6 +230,7 @@ fn rejects_malformed_manifest_and_detects_changes_while_open() {
     let mut store = Store::open(&fixture.root, "scope").unwrap();
     store.save("id", "inbox", &pdf(), None).unwrap();
     fs::write(fixture.manifest("scope"), b"{broken synthetic JSON").unwrap();
+    assert!(store.contains_saved("id").is_err());
     assert!(store.verify_existing("id", "inbox").is_err());
     drop(store);
     assert!(Store::open(&fixture.root, "scope").is_err());
@@ -379,6 +409,9 @@ fn rejects_empty_truncated_pdf_and_explicitly_invalid_json() {
         (b"{\"unfinished\":".as_slice(), Some("application/json")),
         (b"[1,".as_slice(), Some("application/problem+json")),
     ] {
+        if bytes.starts_with(b"%PDF-") {
+            assert_eq!(format_hint(bytes), Some("pdf"));
+        }
         assert!(store.save("id", "inbox", bytes, content_type).is_err());
     }
     assert!(!fixture.manifest("scope").exists());
@@ -387,6 +420,122 @@ fn rejects_empty_truncated_pdf_and_explicitly_invalid_json() {
             .unwrap()
             .count(),
         0
+    );
+}
+
+#[test]
+fn format_hints_describe_signatures_without_proving_format_validity() {
+    for (bytes, expected) in [
+        (
+            b"%PDF-1.7\nsynthetic unfinished document".as_slice(),
+            Some("pdf"),
+        ),
+        (b"\x89PNG\r\n\x1a\n".as_slice(), Some("png")),
+        (b"\xff\xd8\xff".as_slice(), Some("jpeg")),
+        (b"II*\0".as_slice(), Some("tiff")),
+        (b"MM\0*".as_slice(), Some("tiff")),
+        (b"II+\0\x08\0\0\0".as_slice(), Some("tiff")),
+        (b"MM\0+\0\x08\0\0".as_slice(), Some("tiff")),
+        (b"GIF87a".as_slice(), Some("gif")),
+        (b"GIF89a".as_slice(), Some("gif")),
+        (b"PK\x03\x04".as_slice(), Some("zip")),
+        (b"PK\x05\x06".as_slice(), Some("zip")),
+        (b"PK\x07\x08".as_slice(), Some("zip")),
+        (
+            b"\xef\xbb\xbf \t<!DOCTYPE HTML>synthetic".as_slice(),
+            Some("html"),
+        ),
+        (
+            b"\n<HTML>synthetic incomplete markup".as_slice(),
+            Some("html"),
+        ),
+        (
+            "Synthetic UTF-8 text: snowman \u{2603}.\n".as_bytes(),
+            Some("text"),
+        ),
+        (b"<htmlish>synthetic".as_slice(), Some("text")),
+        (b"".as_slice(), None),
+        (b" \r\n\t".as_slice(), None),
+        (b"synthetic\0binary".as_slice(), None),
+        (b"\x01\x02\xff".as_slice(), None),
+        (b"synthetic\x1b[0m control".as_slice(), None),
+    ] {
+        assert_eq!(format_hint(bytes), expected);
+    }
+}
+
+#[test]
+fn binary_hints_are_derived_on_save_and_reuse_without_changing_records() {
+    let fixture = Fixture::new();
+    let mut store = Store::open(&fixture.root, "scope").unwrap();
+    let mut saved_documents = Vec::new();
+    for (index, (bytes, expected)) in [
+        (b"\x89PNG\r\n\x1a\n".as_slice(), Some("png")),
+        (b"\xff\xd8\xff".as_slice(), Some("jpeg")),
+        (b"II*\0".as_slice(), Some("tiff")),
+        (b"GIF89a".as_slice(), Some("gif")),
+        (b"PK\x03\x04".as_slice(), Some("zip")),
+        (
+            b"<!doctype html>synthetic incomplete markup".as_slice(),
+            Some("html"),
+        ),
+        (b"Synthetic UTF-8 document text.\n".as_slice(), Some("text")),
+        (b"\x01\x02\xff".as_slice(), None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("invented-format-{index}");
+        let saved = store
+            .save(&id, "inbox", bytes, Some("application/octet-stream"))
+            .unwrap();
+        assert_eq!(saved.format_hint.as_deref(), expected);
+        assert_eq!(saved.media_kind, "binary");
+        assert_eq!(saved.status, "saved_binary");
+        assert_eq!(saved.path.extension().unwrap(), "bin");
+        assert_eq!(fs::read(&saved.path).unwrap(), bytes);
+        let mut output = serde_json::to_value(&saved).unwrap();
+        if let Some(expected) = expected {
+            assert_eq!(output["format_hint"], expected);
+        } else {
+            assert!(output.get("format_hint").is_none());
+        }
+        // Older structured output still deserializes with an absent hint.
+        output.as_object_mut().unwrap().remove("format_hint");
+        assert_eq!(
+            serde_json::from_value::<SaveResult>(output)
+                .unwrap()
+                .format_hint,
+            None
+        );
+        saved_documents.push((id, bytes.to_vec(), saved));
+    }
+    let manifest_before = fs::read(fixture.manifest("scope")).unwrap();
+    for record in fixture.read_manifest("scope")["entries"]
+        .as_object()
+        .unwrap()
+        .values()
+    {
+        assert!(record.get("format_hint").is_none());
+        assert_eq!(record["kind"], "binary");
+    }
+    drop(store);
+    let mut store = Store::open(&fixture.root, "scope").unwrap();
+    for (id, bytes, saved) in saved_documents {
+        let verified = store.verify_existing(&id, "inbox").unwrap().unwrap();
+        let reused = store.save(&id, "inbox", &bytes, None).unwrap();
+        for result in [&verified, &reused] {
+            assert_eq!(result.format_hint, saved.format_hint);
+            assert_eq!(result.path, saved.path);
+            assert_eq!(result.sha256, saved.sha256);
+            assert_eq!(result.media_kind, "binary");
+            assert_eq!(result.status, "already_saved");
+        }
+        assert_eq!(fs::read(saved.path).unwrap(), bytes);
+    }
+    assert_eq!(
+        fs::read(fixture.manifest("scope")).unwrap(),
+        manifest_before
     );
 }
 
@@ -485,6 +634,7 @@ fn detects_directory_replacement_after_open() {
     let data = fixture.namespace("scope").join("data");
     fs::rename(&data, fixture.namespace("scope").join("old-data")).unwrap();
     fs::create_dir(&data).unwrap();
+    assert!(store.contains_saved("id").is_err());
     assert!(store.save("id", "inbox", &pdf(), None).is_err());
     assert_eq!(fs::read_dir(data).unwrap().count(), 0);
 }

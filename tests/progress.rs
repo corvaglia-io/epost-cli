@@ -66,6 +66,7 @@ fn finished_summary_counts_each_retrieval_outcome_and_resets_for_repeat_runs() {
     ] {
         reporter.render(Event::DocumentComplete {
             status: status.into(),
+            media_kind: Some("pdf".into()),
         });
     }
     assert_eq!(
@@ -87,6 +88,7 @@ fn saved_file_reuse_is_distinct_from_a_new_download() {
     assert_eq!(
         reporter.render(Event::DocumentComplete {
             status: "already_saved".into(),
+            media_kind: Some("pdf".into()),
         }),
         Some("  Already saved; local file verified.".into())
     );
@@ -102,6 +104,7 @@ fn unknown_status_text_is_not_echoed_or_reported_as_success() {
     let rendered = reporter
         .render(Event::DocumentComplete {
             status: "synthetic-secret-response\n\x1b[31m".into(),
+            media_kind: Some("synthetic-secret-media".into()),
         })
         .unwrap();
     assert!(!rendered.contains("synthetic-secret"));
@@ -139,11 +142,49 @@ fn disabled_progress_emits_no_human_text() {
         },
         Event::DocumentComplete {
             status: "saved_pdf".into(),
+            media_kind: Some("pdf".into()),
         },
         Event::Finished { exit_code: 0 },
     ] {
         assert!(reporter.render(event).is_none());
     }
+}
+
+#[test]
+fn cached_non_pdf_content_still_needs_review_and_is_counted() {
+    for media_kind in [
+        Some("json"),
+        Some("binary"),
+        None,
+        Some("synthetic-secret-media"),
+    ] {
+        let mut reporter = Reporter::new(true);
+        assert_eq!(
+            reporter.render(Event::DocumentComplete {
+                status: "already_saved".into(),
+                media_kind: media_kind.map(str::to_owned),
+            }),
+            Some("  Already saved; local file verified, but format still needs review.".into())
+        );
+        assert_eq!(
+            reporter.render(Event::Finished { exit_code: 2 }),
+            Some("Sync finished with items requiring attention: 1 already saved, 1 cached non-PDF needing format review.".into())
+        );
+    }
+}
+
+#[test]
+fn silent_reset_clears_counts_without_emitting_a_second_final_summary() {
+    let mut reporter = Reporter::new(true);
+    reporter.render(Event::DocumentComplete {
+        status: "saved_pdf".into(),
+        media_kind: Some("pdf".into()),
+    });
+    reporter.reset();
+    assert_eq!(
+        reporter.render(Event::Finished { exit_code: 0 }),
+        Some("Sync finished: no documents processed.".into())
+    );
 }
 
 #[test]

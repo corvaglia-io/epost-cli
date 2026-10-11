@@ -188,6 +188,12 @@ async fn partial_progress_explains_preserved_content_manual_action_and_failed_re
         .expect(1)
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/epost/v2/letters/{missing}")))
+        .respond_with(ResponseTemplate::new(404).set_body_string(TOKEN))
+        .expect(1)
+        .mount(&server)
+        .await;
     let output = command(&server)
         .args(["--progress", "sync", "--scope", "inbox", "--output"])
         .arg(temp.path())
@@ -212,7 +218,7 @@ async fn partial_progress_explains_preserved_content_manual_action_and_failed_re
         "1 binary saved",
         "1 pending manual action",
         "1 failed",
-        "Attention (1): provider returned HTTP 404; check unavailable documents in ePost.",
+        "Attention (1): document metadata and content returned HTTP 404; check the document in ePost.",
         "Attention (1): unsupported content preserved locally; review its format manually.",
     ] {
         assert!(
@@ -221,7 +227,7 @@ async fn partial_progress_explains_preserved_content_manual_action_and_failed_re
         );
     }
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     assert!(
         requests
             .iter()

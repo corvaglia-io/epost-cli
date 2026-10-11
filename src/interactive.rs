@@ -695,6 +695,13 @@ fn show_document(record: &Retrieval, prompts: &mut impl Prompts) -> Result<()> {
     if record.status == "awaiting_manual_acceptance_or_status_verification" {
         return prompts.line("Requires action in the ePost app. Check its status and any required action there, then retry.");
     }
+    if record.status == "failed" {
+        prompts.line("Download unavailable; no content was saved.")?;
+        for line in epost_cli::summary::document_attention(&value(record)?) {
+            prompts.line(&line)?;
+        }
+        return Ok(());
+    }
     if let Some(document) = &record.document {
         let label = if record.status == "already_saved" {
             "Already saved and verified"
@@ -717,28 +724,17 @@ fn usable_id(id: &str) -> bool {
 }
 
 fn show_sync(report: &Value, code: u8, prompts: &mut impl Prompts) -> Result<()> {
+    for line in epost_cli::summary::sync_summary(report, code) {
+        prompts.line(&line)?;
+    }
     let documents = report
         .get("documents")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let count = |status: &str| {
-        documents
-            .iter()
-            .filter(|d| d.get("status").and_then(Value::as_str) == Some(status))
-            .count()
-    };
-    prompts.line(&format!(
-        "Sync: {} new PDFs, {} already saved, {} require action in ePost, {} failed.",
-        count("saved_pdf"),
-        count("already_saved"),
-        count("awaiting_manual_acceptance_or_status_verification"),
-        count("failed")
-    ))?;
     if code != 0 {
-        prompts.line(&format!(
-            "Sync needs attention (exit {code}). Review the ePost app and the reported issues."
-        ))?;
+        let mut shown = 0;
+        let mut additional = 0;
         for document in documents {
             let status = document.get("status").and_then(Value::as_str);
             let media = document
@@ -746,8 +742,13 @@ fn show_sync(report: &Value, code: u8, prompts: &mut impl Prompts) -> Result<()>
                 .and_then(|saved| saved.get("media_kind"))
                 .and_then(Value::as_str);
             if !matches!(status, Some("saved_pdf" | "already_saved")) || media != Some("pdf") {
+                if shown >= 20 {
+                    additional += 1;
+                    continue;
+                }
+                shown += 1;
                 prompts.line(&format!(
-                    "  Document {}: {} ({}). {}",
+                    "  Document {}: {} ({}).",
                     safe_line(
                         document
                             .get("letter_id")
@@ -755,31 +756,15 @@ fn show_sync(report: &Value, code: u8, prompts: &mut impl Prompts) -> Result<()>
                             .unwrap_or("without ID")
                     ),
                     safe_line(status.unwrap_or("unknown result")),
-                    safe_line(media.unwrap_or("no saved content")),
-                    safe_line(
-                        document
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Check this document manually.")
-                    )
+                    safe_line(media.unwrap_or("no saved content"))
                 ))?;
             }
         }
-    }
-    if let Some(issues) = report.get("issues").and_then(Value::as_array) {
-        for issue in issues.iter().filter_map(Value::as_str) {
-            prompts.line(&safe_line(issue))?;
+        if additional > 0 {
+            prompts.line(&format!(
+                "  {additional} more documents need attention. Use --json for the complete report."
+            ))?;
         }
     }
-    if let Some(inventories) = report.get("inventories").and_then(Value::as_array) {
-        for inventory in inventories {
-            if let Some(issues) = inventory.get("issues").and_then(Value::as_array) {
-                for issue in issues.iter().filter_map(Value::as_str) {
-                    prompts.line(&safe_line(issue))?;
-                }
-            }
-        }
-    }
-    prompts
-        .line("Compare with the ePost app; API pagination cannot prove complete mailbox coverage.")
+    Ok(())
 }

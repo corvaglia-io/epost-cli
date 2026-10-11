@@ -11,3 +11,4 @@ pub mod pagination;
 pub mod progress;
 pub mod secret;
 pub mod storage;
+pub mod summary;

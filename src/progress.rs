@@ -10,12 +10,28 @@ use std::io::{self, Write};
 pub enum Event {
     Authenticating,
     ArchiveFolders,
-    InventoryStarted { label: String },
-    Page { page: u32, documents: usize },
-    InventoryComplete { documents: usize, complete: bool },
-    DocumentStarted { index: usize, total: usize },
-    DocumentComplete { status: String },
-    Finished { exit_code: u8 },
+    InventoryStarted {
+        label: String,
+    },
+    Page {
+        page: u32,
+        documents: usize,
+    },
+    InventoryComplete {
+        documents: usize,
+        complete: bool,
+    },
+    DocumentStarted {
+        index: usize,
+        total: usize,
+    },
+    DocumentComplete {
+        status: String,
+        media_kind: Option<String>,
+    },
+    Finished {
+        exit_code: u8,
+    },
 }
 
 #[derive(Default)]
@@ -24,6 +40,7 @@ struct Counts {
     json: usize,
     binary: usize,
     reused: usize,
+    reused_other: usize,
     pending: usize,
     failed: usize,
     deferred: usize,
@@ -47,6 +64,12 @@ impl Reporter {
         if let Some(line) = self.render(event) {
             let _ = writeln!(io::stderr().lock(), "{line}");
         }
+    }
+
+    /// Starts a fresh count sequence without displaying a final summary.
+    /// Frontends that own a shared final summary can use this between runs.
+    pub fn reset(&mut self) {
+        self.counts = Counts::default();
     }
 
     /// Renders progress without accessing a terminal, useful to alternative
@@ -83,7 +106,7 @@ impl Reporter {
             Event::DocumentStarted { index, total } => {
                 format!("Checking document {index} of {total}…")
             }
-            Event::DocumentComplete { status } => match status.as_str() {
+            Event::DocumentComplete { status, media_kind } => match status.as_str() {
                 "saved_pdf" => {
                     self.counts.pdf += 1;
                     "  Saved PDF.".into()
@@ -98,7 +121,13 @@ impl Reporter {
                 }
                 "already_saved" => {
                     self.counts.reused += 1;
-                    "  Already saved; local file verified.".into()
+                    if media_kind.as_deref() == Some("pdf") {
+                        "  Already saved; local file verified.".into()
+                    } else {
+                        self.counts.reused_other += 1;
+                        "  Already saved; local file verified, but format still needs review."
+                            .into()
+                    }
                 }
                 "awaiting_manual_acceptance_or_status_verification" => {
                     self.counts.pending += 1;
@@ -127,7 +156,7 @@ impl Reporter {
                     _ => "Sync stopped after an error",
                 };
                 let summary = self.counts.summary();
-                self.counts = Counts::default();
+                self.reset();
                 format!("{result}: {summary}.")
             }
         };
@@ -142,6 +171,7 @@ impl Counts {
             (self.json, "JSON saved"),
             (self.binary, "binary saved"),
             (self.reused, "already saved"),
+            (self.reused_other, "cached non-PDF needing format review"),
             (self.pending, "pending manual action"),
             (self.failed, "failed"),
             (self.deferred, "deferred"),

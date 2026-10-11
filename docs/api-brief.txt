@@ -217,3 +217,26 @@ changes, repository history and CI artifacts for secrets/personal metadata.
 Do not publish a full vendor schema without checking its redistribution terms;
 a documented endpoint subset and links are sufficient. Read-only API usage
 and locally successful tests do not prove production compatibility.
+
+2026-10-11 public-contract recheck for retrieval diagnostics:
+- GET /epost/v2/letters/{letter-id}/content HTTP 404 is generic resource
+  unavailability, not proof of deletion or an intentional attachment-free letter.
+  One canonical GET /epost/v2/letters/{letter-id} can distinguish unavailable
+  content from unavailable metadata. Validate returned ID, honor registered
+  states, stop on auth loss; never follow letterContentReference or substitute
+  metadata for downloaded content. documentMessage describes short-message
+  content but does not guarantee that no downloadable attachment exists.
+- Directory counts and hasSubDirectories are optional, without freshness or
+  snapshot guarantees. Only exactly zero plus explicitly no subfolders is an
+  informational empty observation for an unselectable folder. Coverage remains
+  unverified; unknown/nonzero counts or possible subfolders remain partial.
+- Search has optional value and search-location ALL/INBOX/STORAGE/TRASH. An
+  omitted value is not documented as an exhaustive branded-archive listing.
+  Do not use default ALL or TRASH or silently invent an archive fallback.
+Source: https://api.epost.ch/openapi?query=All (YAML, anonymous public retrieval).
+- Inbox polling: GET /epost/v2/letters/inbox/count returns unread count as
+  JSON int32; optional sender-participant-id is its only documented query.
+  Reject negative/noninteger/out-of-range counts. Letter.readStatus enum is
+  READ/UNREAD; listing read-status filter is READ/UNREAD/ALL. A count is not an
+  inventory total. Unread and locally unsaved are independent; do not mutate
+  read status to track successful retrieval.

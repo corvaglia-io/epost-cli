@@ -32,6 +32,9 @@ pub struct SaveResult {
     pub status: String,
     pub media_kind: String,
     pub content_type: Option<String>,
+    /// Descriptive byte signature only; does not establish format validity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -134,6 +137,17 @@ impl Store {
         Ok(store)
     }
 
+    /// Checks membership in the manifest validated by `open`, without changing
+    /// sources or rereading documents. This is a recorded-download lookup;
+    /// `verify_existing` checks current content integrity when reuse is needed.
+    pub fn contains_saved(&self, letter_id: &str) -> Result<bool> {
+        validate_identifier(letter_id)?;
+        self.check_directories()?;
+        self.check_manifest_unchanged()?;
+        let key = document_key(&self.manifest.namespace_hash, letter_id);
+        Ok(self.manifest.entries.contains_key(&key))
+    }
+
     /// Verifies the saved bytes before adding a new inbox/archive source.
     /// An unrecorded orphan returns `None`; a later `save` may adopt it after
     /// comparing it with freshly retrieved bytes.
@@ -146,9 +160,9 @@ impl Store {
         let Some(record) = self.manifest.entries.get(&key).cloned() else {
             return Ok(None);
         };
-        self.verify_record(&record)?;
+        let hint = self.verify_record(&record)?;
         self.record_source(&key, source)?;
-        Ok(Some(self.result(&record, "already_saved")))
+        Ok(Some(self.result(&record, "already_saved", hint)))
     }
 
     pub fn save(
@@ -167,7 +181,7 @@ impl Store {
         self.check_manifest_unchanged()?;
         let key = document_key(&self.manifest.namespace_hash, letter_id);
         if let Some(record) = self.manifest.entries.get(&key).cloned() {
-            self.verify_record(&record)?;
+            let hint = self.verify_record(&record)?;
             if record.sha256 != digest || record.bytes != bytes.len() as u64 || record.kind != kind
             {
                 return Err(Error::Storage(
@@ -175,7 +189,7 @@ impl Store {
                 ));
             }
             self.record_source(&key, source)?;
-            return Ok(self.result(&record, "already_saved"));
+            return Ok(self.result(&record, "already_saved", hint));
         }
         let name = format!("{key}.{}", kind.extension());
         let mut orphan_exists = false;
@@ -226,11 +240,11 @@ impl Store {
             kind,
             content_type: content_type.map(str::to_owned),
         };
-        self.verify_record(&record)?;
+        let hint = self.verify_record(&record)?;
         let mut next = self.manifest.clone();
         next.entries.insert(key, record.clone());
         self.persist_manifest(next)?;
-        Ok(self.result(&record, kind.saved_status()))
+        Ok(self.result(&record, kind.saved_status(), hint))
     }
 
     fn validate_manifest(&self, namespace: &str) -> Result<()> {
@@ -255,7 +269,7 @@ impl Store {
             for source in &record.sources {
                 validate_identifier(source)?;
             }
-            self.verify_record(record)?;
+            let _ = self.verify_record(record)?;
         }
         Ok(())
     }
@@ -266,7 +280,7 @@ impl Store {
         self.data_dir.validate()
     }
 
-    fn verify_record(&self, record: &Record) -> Result<()> {
+    fn verify_record(&self, record: &Record) -> Result<Option<&'static str>> {
         self.check_directories()?;
         let name = record
             .path
@@ -283,7 +297,7 @@ impl Store {
         {
             return Err(Error::Storage("saved document is corrupt"));
         }
-        Ok(())
+        Ok(format_hint(&bytes))
     }
 
     fn check_manifest_unchanged(&self) -> Result<()> {
@@ -342,7 +356,7 @@ impl Store {
         Ok(())
     }
 
-    fn result(&self, record: &Record, status: &str) -> SaveResult {
+    fn result(&self, record: &Record, status: &str, hint: Option<&'static str>) -> SaveResult {
         SaveResult {
             path: self.namespace_dir.path.join(&record.path),
             sha256: record.sha256.clone(),
@@ -350,8 +364,71 @@ impl Store {
             status: status.to_owned(),
             media_kind: record.kind.name().to_owned(),
             content_type: record.content_type.clone(),
+            format_hint: hint.map(str::to_owned),
         }
     }
+}
+
+/// Returns a conservative descriptive hint from bounded content bytes.
+///
+/// Magic signatures and text prefixes are not proof that a complete, valid or
+/// safe document is present. This helper never changes storage classification,
+/// filenames, success status or integrity checks, and ignores provider metadata.
+pub fn format_hint(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.is_empty() || bytes.len() > MAX_CONTENT_BYTES {
+        return None;
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return Some("pdf");
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("png");
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some("jpeg");
+    }
+    if bytes.starts_with(b"II*\0")
+        || bytes.starts_with(b"MM\0*")
+        || bytes.starts_with(b"II+\0\x08\0\0\0")
+        || bytes.starts_with(b"MM\0+\0\x08\0\0")
+    {
+        return Some("tiff");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("gif");
+    }
+    if bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"PK\x07\x08")
+    {
+        return Some("zip");
+    }
+    let prefix = bytes
+        .strip_prefix(b"\xef\xbb\xbf")
+        .unwrap_or(bytes)
+        .trim_ascii_start();
+    for marker in [b"<html".as_slice(), b"<!doctype html".as_slice()] {
+        if prefix
+            .get(..marker.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(marker))
+            && prefix
+                .get(marker.len())
+                .is_some_and(|next| next.is_ascii_whitespace() || matches!(next, b'>' | b'/'))
+        {
+            return Some("html");
+        }
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    if text
+        .chars()
+        .all(|character| !character.is_control() || matches!(character, '\r' | '\n' | '\t'))
+        && text
+            .chars()
+            .any(|character| !character.is_whitespace() && character != '\u{feff}')
+    {
+        return Some("text");
+    }
+    None
 }
 
 fn hash(bytes: &[u8]) -> String {

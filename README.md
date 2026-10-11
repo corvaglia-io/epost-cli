@@ -74,6 +74,29 @@ On another OS, `login` without `--remember` can convert a copied Mac profile to 
 
 A selected profile supplies mailbox identity and environment. Explicit identity/environment flags cannot be combined with it. Download and sync may override the saved destination with `--output`; sync may override the saved scope with `--scope`. Without a profile, the existing explicit flags are required. Existing script commands retain their JSON reports; guided commands write their readable interface to stderr and reject `--json`/`--password-stdin`.
 
+### Inbox checks
+
+```sh
+# One unread-count request; no local store access or document downloads
+epost-cli --profile personal inbox check --unread-only
+# Also find inbox IDs not yet recorded in the local store
+epost-cli --profile personal inbox check
+# Sync the inbox only when unread or unsaved items are observed
+epost-cli --profile personal inbox check --sync-if-needed
+# Cheap unread-only trigger (does not catch already-read unsaved mail)
+epost-cli --profile personal inbox check --unread-only --sync-if-needed
+# Structured counts and trigger flags for a scheduler
+epost-cli --json --profile personal inbox check
+```
+
+The API supplies `READ`/`UNREAD` metadata and a dedicated unread-count endpoint. Reading or downloading content does not mark it read. “New” here means an inbox ID absent from this profile's local document manifest; it is not the provider's read status or a first-seen timestamp. A saved document can remain unread and keep triggering a conditional check; repeated syncs verify and reuse its file. Unsaved failures remain eligible for another sync.
+
+The default check walks bounded inbox metadata pages and opens/validates the local store without fetching content or changing its manifest. This includes local integrity verification, so `--unread-only` is cheaper for frequent polling. That mode makes one count request and does not evaluate unsaved mail; zero unread is not proof that all documents are saved. Conditional sync is explicitly opt-in, always targets the inbox (even if the profile's normal sync scope is both), and refreshes the metadata inventory before retrieving eligible content. Archive additions need a regular archive/both sync.
+
+JSON checks expose `has_unread`, `has_new`, `sync_needed`, `sync_requested` and `sync_performed`. A missing/unknown read status or unfinished inventory produces exit 2; unknown answers are `null`, never a misleading false. Positive observations can still trigger the requested sync after non-authentication partial checks; authentication failure stops further requests. A sync attempt sets `sync_performed: true`. A completed retrieval report is nested under `sync` with `sync_exit_code`; a fatal attempt instead has a redacted `sync_error` and `sync_exit_code`. `check_exit_code` retains the original check result, and the final exit preserves any check or sync failure. Exit 0 means the check succeeded, regardless of whether it found mail; schedulers should inspect the flags. Without a profile, supply explicit mailbox identity and `--output` for the full check or conditional sync. A standalone `--unread-only` check needs no output folder.
+
+[Official OpenAPI](https://api.epost.ch/openapi?query=All) documents the read filter and `GET /epost/v2/letters/inbox/count`; count and offset APIs provide observations without snapshot or complete-coverage guarantees.
+
 ### Repeat syncs and scheduling
 
 ```sh
@@ -89,11 +112,11 @@ epost-cli --json --profile personal sync
 
 Sync inventories the selected scope on each run. It verifies saved documents against the local manifest and downloads only unsaved content. A repeat reports `already_saved`; newly discovered documents are downloaded. This is not a provider change-feed or a date watermark: scanning all configured pages avoids intentionally skipping older documents that become visible later. Failed documents can be retried on the next run. Integrity failures require attention, and pending registered letters remain partial results. Keep the same store between runs and alert on every nonzero exit. Scheduling and Paperless ingestion remain external.
 
-Sync shows sign-in, inventory pages, document checks and retrieval outcomes on stderr when stderr is a terminal and `--json` is absent. The final human summary counts saved documents, verified existing files and items requiring attention. `--progress` enables progress explicitly, including alongside `--json`; `--no-progress` disables it. Progress displays counts and fixed outcomes without document titles or IDs. It is based on work observed so far and does not claim a mailbox total or complete coverage.
+Sync shows sign-in, inventory pages, document checks and retrieval outcomes on stderr when stderr is a terminal and `--json` is absent. The final human summary counts saved documents, verified existing files and items requiring attention. The other-format count includes both new and cached non-PDF content; it overlaps the already-saved count. `--progress` enables progress explicitly, including alongside `--json`; `--no-progress` disables it. Progress displays counts and fixed outcomes without document titles or IDs. It is based on work observed so far and does not claim a mailbox total or complete coverage.
 
 With stdout connected to a terminal, standalone sync shows a readable result summary by default. `--json` forces a structured report; redirected stdout also retains JSON, so scripts can save the report while progress remains visible on stderr. For example, `epost-cli --progress --json --profile personal sync > /absolute/private-folder/report.json` writes detailed results outside this repository. The caller must choose a private destination and file permissions.
 
-A partial result is not necessarily a failed download: pending registered letters need manual action or status verification in ePost; JSON/binary content is preserved but needs format review; unsupported archive selectors or interrupted pagination leave inventory incomplete. The report distinguishes these reasons. Repeating a run reuses verified saved files and retries eligible failures; it cannot resolve acceptance requirements or unsupported provider selectors.
+A partial result is not necessarily a failed download: pending registered letters need manual action or status verification in ePost; JSON/binary content is preserved but needs format review; unsupported archive selectors or interrupted pagination leave inventory incomplete. The report distinguishes these reasons. On a content HTTP 404, sync makes one bounded metadata check at the canonical letter endpoint. The result distinguishes available metadata with unavailable content, unavailable letter metadata, and an unsuccessful metadata check. A changed pending registered status still requires manual action. A 404 does not prove deletion, and message metadata is never substituted for a document or cached as a successful download. The JSON `diagnostic` contains fixed reason codes, HTTP statuses, a known letter type and presence flags; it contains no message body or reference URL. Repeating a run reuses verified saved files and retries eligible failures; it cannot resolve acceptance requirements or unsupported provider selectors.
 
 For a container or remote scheduler, provision the profile file and persistent document folder on that host and select the config path explicitly. Supply credentials through that scheduler's secret mechanism; a Mac Keychain entry does not travel with the profile. A local macOS scheduler can use an explicitly saved Keychain password if its login Keychain is accessible. Do not place private profiles or runtime credentials in public CI.
 
@@ -134,7 +157,7 @@ epost-cli --json --tenant-kind private --tenant-id example-tenant --company-id 0
 
 `download` works for inbox or archived letter IDs. `sync --scope inbox|archive|both` makes the retrieval scope explicit and stores documents across that scope. Archive sync enumerates the flat folder list, visits root storage, then each unique selectable directory without assuming a single parent or recursively walking folder links. `archive folders` preserves the flat directory metadata, including multiple-parent IDs.
 
-`list` fetches one page by default (`--page-size 48 --offset 0`). Use `--all` to traverse from offset zero; `--offset` and `--all` cannot be combined. Traversal stops after a short/empty page or an error/safety bound. Limits are page size 1–1000, default 1000 pages, at most 100,000 entries per inventory, and at most 100,000 retrieval records per sync. Detected overlap, missing IDs, repeated pages and unsupported directory selectors produce a partial result. A single-page command can succeed without claiming pagination completeness.
+`list` fetches one page by default (`--page-size 48 --offset 0`). Use `--all` to traverse from offset zero; `--offset` and `--all` cannot be combined. Traversal stops after a short/empty page or an error/safety bound. Limits are page size 1–1000, default 1000 pages, at most 100,000 entries per inventory, and at most 100,000 retrieval records per sync. Detected overlap, missing IDs, repeated pages and unselectable folders that are not explicitly reported empty without subfolders produce a partial result. A single-page command can succeed without claiming pagination completeness.
 
 ## Output and exit codes
 
@@ -158,9 +181,9 @@ Fatal errors write a redacted diagnostic to stderr. With `--json`:
 | 3 | Authentication failed (including HTTP 401/403) |
 | 4 | Storage integrity failure or conflicting store access |
 
-For reports with multiple failures, storage integrity takes precedence over authentication, then partial retrieval. Authentication loss stops further requests. Later-page errors retain previously listed metadata; sync can retrieve those letters after non-authentication page failures. Fatal errors have no normal stdout report. Callers should ignore unknown JSON fields and check both exit status and individual retrieval records.
+For reports with multiple failures, storage integrity takes precedence over authentication, then partial retrieval. Authentication loss stops further requests. Later-page errors retain previously listed metadata; sync can retrieve those letters after non-authentication page failures. Fatal errors have no normal stdout report, except a conditional sync failure after a completed inbox check: that check is retained with its redacted nested sync error. Callers should ignore unknown JSON fields and check both exit status and individual retrieval records.
 
-Sync reports include inventory counts/issues, `pagination_complete`, individual document statuses, and `mailbox_coverage_verified: false`. Saved-document records expose path, SHA-256, byte count, media kind and original `content_type` (null if absent); repeat runs retain the original type. Document statuses include `saved_pdf`, `saved_json`, `saved_binary`, `already_saved`, `awaiting_manual_acceptance_or_status_verification`, `failed`, and `deferred_due_to_authentication_failure`. JSON/binary content is preserved but counts as unsupported retrieval (exit 2), including on repeat runs. Pending/unknown registered-letter states remain partial even if previously cached content exists.
+Sync reports include inventory counts/issues, `pagination_complete`, individual document statuses, and `mailbox_coverage_verified: false`. Saved-document records expose path, SHA-256, byte count, media kind and original `content_type` (null if absent); repeat runs retain the original type. Optional `format_hint` describes a byte signature (PDF, PNG, JPEG, TIFF, GIF, ZIP, HTML or text) on new content and verified cached files. It does not validate or convert the format, change stored filenames or manifest records, or make non-PDF retrieval supported. Document statuses include `saved_pdf`, `saved_json`, `saved_binary`, `already_saved`, `awaiting_manual_acceptance_or_status_verification`, `failed`, and `deferred_due_to_authentication_failure`. JSON/binary content is preserved but counts as unsupported retrieval (exit 2), including on repeat runs. Pending/unknown registered-letter states remain partial even if previously cached content exists.
 
 Save the report somewhere private and configure your automation engine to alert on **every nonzero exit**, including exit 2. A successful download alone is insufficient evidence that all mail has been noticed or acted on. Scheduling, notifications and Paperless ingestion are outside this version.
 
@@ -189,7 +212,7 @@ No provider integration suite or authenticated provider test is included. `--env
 
 ## Known provider limitations and references
 
-Offset lists expose no snapshot, total or cursor; even normal termination cannot establish a consistent complete mailbox inventory. Inbox requests include all six documented letter types; future types may need an update. Branded archive directories can have empty IDs with no documented distinct selector, so sync reports partial rather than treating them as root storage. The content schema is ambiguous about PDF versus JSON/binary responses. Registered-letter acceptance remains a manual action.
+Offset lists expose no snapshot, total or cursor; even normal termination cannot establish a consistent complete mailbox inventory. Inbox requests include all six documented letter types; future types may need an update. Branded archive directories can have empty IDs with no documented distinct selector. Sync never treats them as root storage. An unselectable folder is recorded as `unselectable_empty` only when the provider explicitly reports zero documents and no subfolders. This is an empty observation, not a verified snapshot. Unknown, negative or positive counts, or possible subfolders, remain partial. Every selectable folder is still scanned even when its reported count is zero. The JSON `archive_directories` records each observed folder and the selection outcome so users can identify folders needing attention. Archive search supports a STORAGE scope, but omitted-keyword behavior and complete branded-folder coverage are undocumented, so it is not used to claim completeness. The content schema is ambiguous about PDF versus JSON/binary responses. Registered-letter acceptance remains a manual action.
 
 Contract research was performed on 2026-10-11. Only the required contract notes are maintained in [docs/api-brief.txt](docs/api-brief.txt); the full provider specification is linked, not redistributed.
 

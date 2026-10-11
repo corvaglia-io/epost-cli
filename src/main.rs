@@ -10,6 +10,7 @@ use epost_cli::{
     progress::{Event, Reporter},
     secret::Secret,
     storage::{SaveResult, Store},
+    summary::{attention_lines, sync_summary},
 };
 
 mod interactive;
@@ -121,6 +122,25 @@ enum Command {
 #[derive(Subcommand)]
 enum InboxCommand {
     List(ListArgs),
+    /// Check unread or unsaved inbox items without downloading content.
+    Check(CheckArgs),
+}
+
+#[derive(Args)]
+struct CheckArgs {
+    /// One unread-count request; does not check locally unsaved documents.
+    #[arg(long)]
+    unread_only: bool,
+    /// Local document store for comparing IDs (otherwise use the profile).
+    #[arg(long)]
+    output: Option<PathBuf>,
+    /// Sync the inbox if unread or locally unsaved items are observed.
+    #[arg(long)]
+    sync_if_needed: bool,
+    #[arg(long, default_value_t = 48, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    page_size: u32,
+    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=100000))]
+    max_pages: u32,
 }
 
 #[derive(Subcommand)]
@@ -216,6 +236,25 @@ struct Retrieval {
     document: Option<SaveResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<ContentDiagnostic>,
+}
+
+/// Fixed codes and flags only: never response bodies, titles or reference URLs.
+#[derive(Serialize)]
+struct ContentDiagnostic {
+    reason_code: &'static str,
+    content_http_status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata_http_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    letter_type: Option<&'static str>,
+    has_message: bool,
+    has_file_name: bool,
+    has_content_reference: bool,
+    registered_pending: bool,
 }
 
 #[derive(Serialize)]
@@ -225,6 +264,7 @@ struct SyncReport {
     mailbox_coverage_verified: bool,
     pagination_complete: bool,
     inventories: Vec<Value>,
+    archive_directories: Vec<Value>,
     documents: Vec<Retrieval>,
     issues: Vec<String>,
 }
@@ -503,6 +543,39 @@ fn registered_pending(letter: &Letter) -> bool {
         )
 }
 
+fn content_diagnostic(letter: &Letter) -> ContentDiagnostic {
+    let present = |field: &str| {
+        letter
+            .extra
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    let letter_type = match letter.letter_type.as_deref() {
+        Some("SIMPLE_SHORT_MESSAGE") => Some("SIMPLE_SHORT_MESSAGE"),
+        Some("CLASSIC_LETTER") => Some("CLASSIC_LETTER"),
+        Some("SMART_LETTER") => Some("SMART_LETTER"),
+        Some("SMART_LETTER_ANSWER") => Some("SMART_LETTER_ANSWER"),
+        Some("INCAMAIL") => Some("INCAMAIL"),
+        Some("SECURESEND") => Some("SECURESEND"),
+        _ => None,
+    };
+    ContentDiagnostic {
+        reason_code: "content_unavailable_metadata_available",
+        content_http_status: 404,
+        metadata_http_status: None,
+        metadata_error: None,
+        letter_type,
+        has_message: present("documentMessage"),
+        has_file_name: letter
+            .file_name
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty()),
+        has_content_reference: present("letterContentReference"),
+        registered_pending: registered_pending(letter),
+    }
+}
+
 async fn retrieve(
     client: &mut ApiClient,
     store: &mut Store,
@@ -522,6 +595,7 @@ async fn retrieve(
             status: "awaiting_manual_acceptance_or_status_verification".into(),
             document: existing,
             error: None,
+            diagnostic: None,
         });
     }
     if let Some(document) = existing {
@@ -531,9 +605,52 @@ async fn retrieve(
             status: document.status.clone(),
             document: Some(document),
             error: None,
+            diagnostic: None,
         });
     }
-    let content = client.content(id).await?;
+    let content = match client.content(id).await {
+        Ok(content) => content,
+        Err(Error::Http(404)) => {
+            // One canonical, bounded metadata check. Never follow a provider's
+            // content reference or substitute metadata for a downloaded file.
+            let mut diagnostic = content_diagnostic(letter);
+            let mut status = "failed";
+            match client.letter(id).await {
+                Ok(current) if current.id.as_deref() == Some(id) => {
+                    diagnostic = content_diagnostic(&current);
+                    diagnostic.metadata_http_status = Some(200);
+                    if registered_pending(&current) {
+                        status = "awaiting_manual_acceptance_or_status_verification";
+                    }
+                }
+                Ok(_) => {
+                    diagnostic.reason_code = "metadata_id_mismatch";
+                    diagnostic.metadata_http_status = Some(200);
+                }
+                Err(error) if error.exit_code() == 3 => return Err(error),
+                Err(Error::Http(404)) => {
+                    diagnostic.reason_code = "letter_unavailable";
+                    diagnostic.metadata_http_status = Some(404);
+                }
+                Err(error) => {
+                    diagnostic.reason_code = "metadata_check_failed";
+                    if let Error::Http(code) = &error {
+                        diagnostic.metadata_http_status = Some(*code);
+                    }
+                    diagnostic.metadata_error = Some(error.to_string());
+                }
+            }
+            return Ok(Retrieval {
+                letter_id: Some(id.into()),
+                source: source.into(),
+                status: status.into(),
+                document: None,
+                error: Some(Error::Http(404).to_string()),
+                diagnostic: Some(diagnostic),
+            });
+        }
+        Err(error) => return Err(error),
+    };
     let document = store.save(id, source, &content.bytes, content.content_type.as_deref())?;
     Ok(Retrieval {
         letter_id: Some(id.into()),
@@ -541,6 +658,7 @@ async fn retrieve(
         status: document.status.clone(),
         document: Some(document),
         error: None,
+        diagnostic: None,
     })
 }
 
@@ -560,19 +678,24 @@ async fn sync(
 ) -> Result<(Value, u8)> {
     let mut reporter = Reporter::new(progress_enabled(cli));
     let result = sync_with_progress(cli, client, mailbox, args, &mut reporter).await;
-    reporter.event(Event::Finished {
-        exit_code: match &result {
-            Ok((_, code)) => *code,
-            Err(error) => error.exit_code(),
-        },
-    });
-    if progress_enabled(cli)
-        && let Ok((report, _)) = &result
-    {
-        for line in attention_lines(report) {
-            let _ = writeln!(io::stderr().lock(), "{line}");
+    // TTY and guided views own the final human summary. JSON/pipe users can
+    // opt into a single progress summary on stderr while stdout stays machine-readable.
+    if matches!(cli.command, Command::Sync(_)) && (cli.json || !io::stdout().is_terminal()) {
+        reporter.event(Event::Finished {
+            exit_code: match &result {
+                Ok((_, code)) => *code,
+                Err(error) => error.exit_code(),
+            },
+        });
+        if progress_enabled(cli)
+            && let Ok((report, _)) = &result
+        {
+            for line in attention_lines(report) {
+                let _ = writeln!(io::stderr().lock(), "{line}");
+            }
         }
     }
+
     result
 }
 
@@ -589,6 +712,7 @@ async fn sync_with_progress(
         mailbox_coverage_verified: false,
         pagination_complete: true,
         inventories: Vec::new(),
+        archive_directories: Vec::new(),
         documents: Vec::new(),
         issues: Vec::new(),
     };
@@ -602,29 +726,48 @@ async fn sync_with_progress(
         match client.directories().await {
             Ok(directories) => {
                 let mut seen = std::collections::HashSet::new();
-                for directory in directories.into_iter().take(10_001) {
-                    if sources.len() > 10_000 {
+                for (index, directory) in directories.into_iter().enumerate() {
+                    if index >= 10_000 {
                         report.pagination_complete = false;
                         report
                             .issues
                             .push("archive directory safety limit reached".into());
                         break;
                     }
-                    match directory.directory_id.filter(|id| !id.is_empty()) {
+                    let observation = json!({
+                        "directory_id": directory.directory_id,
+                        "name": directory.directory_name,
+                        "number_of_documents": directory.number_of_documents,
+                        "has_sub_directories": directory.has_sub_directories,
+                        "parent_directory_ids": directory.parent_directory_ids,
+                    });
+                    let selection = match directory.directory_id.filter(|id| !id.is_empty()) {
                         Some(id) if seen.insert(id.clone()) => {
-                            sources.push(Source::ArchiveDirectory(id))
+                            sources.push(Source::ArchiveDirectory(id));
+                            "selected"
                         }
                         Some(_) => {
                             report.pagination_complete = false;
                             report.issues.push("duplicate archive directory ID".into());
+                            "duplicate"
+                        }
+                        None if directory.number_of_documents == Some(0)
+                            && directory.has_sub_directories == Some(false) =>
+                        {
+                            // An observation, not proof of complete mailbox coverage.
+                            "unselectable_empty"
                         }
                         None => {
                             report.pagination_complete = false;
                             report
                                 .issues
                                 .push("archive directory has no documented usable selector".into());
+                            "unselectable"
                         }
-                    }
+                    };
+                    report.archive_directories.push(json!({
+                        "directory": observation, "selection": selection,
+                    }));
                 }
             }
             Err(error) => {
@@ -695,6 +838,7 @@ async fn sync_with_progress(
             {
                 reporter.event(Event::DocumentComplete {
                     status: "deferred_due_to_authentication_failure".into(),
+                    media_kind: None,
                 });
                 report.documents.push(Retrieval {
                     letter_id: letter.id,
@@ -702,6 +846,7 @@ async fn sync_with_progress(
                     status: "deferred_due_to_authentication_failure".into(),
                     document: None,
                     error: None,
+                    diagnostic: None,
                 });
             }
             report.issues.push(
@@ -725,6 +870,7 @@ async fn sync_with_progress(
                 Ok(record) => {
                     reporter.event(Event::DocumentComplete {
                         status: record.status.clone(),
+                        media_kind: record.document.as_ref().map(|d| d.media_kind.clone()),
                     });
                     if !supported(&record) {
                         exit = exit.max(2);
@@ -734,6 +880,7 @@ async fn sync_with_progress(
                 Err(error) => {
                     reporter.event(Event::DocumentComplete {
                         status: "failed".into(),
+                        media_kind: None,
                     });
                     let code = error.exit_code();
                     exit = exit.max(if code == 3 || code == 4 { code } else { 2 });
@@ -743,6 +890,7 @@ async fn sync_with_progress(
                         status: "failed".into(),
                         document: None,
                         error: Some(error.to_string()),
+                        diagnostic: None,
                     });
                     if code == 3 {
                         report.issues.push(
@@ -761,115 +909,193 @@ async fn sync_with_progress(
     Ok((value(report)?, exit))
 }
 
-fn attention_lines(report: &Value) -> Vec<String> {
-    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
-    let mut add = |reason: String| *reasons.entry(reason).or_default() += 1;
-    if let Some(documents) = report["documents"].as_array() {
-        for document in documents {
-            match document["status"].as_str() {
-                Some("saved_json" | "saved_binary" | "already_saved")
-                    if document["document"]["media_kind"].as_str() != Some("pdf") =>
-                {
-                    add("unsupported content preserved locally; review its format manually".into())
+async fn check_inbox(
+    cli: &Cli,
+    client: &mut ApiClient,
+    mailbox: &Mailbox,
+    args: &CheckArgs,
+) -> Result<(Value, u8)> {
+    let (mut report, mut code) = if args.unread_only {
+        let count = client.inbox_unread_count().await?;
+        (
+            json!({
+                "mode": "unread_count", "unread_count": count,
+                "has_unread": count > 0, "has_new": null,
+                "sync_needed": count > 0, "pagination_complete": null,
+                "mailbox_coverage_verified": false, "issues": [],
+            }),
+            0,
+        )
+    } else {
+        let destination = output(cli, args.output.as_deref())?;
+        let store = Store::open(&destination, &namespace(cli, mailbox)?)?;
+        let inventory =
+            pagination::collect(client, Source::Inbox, args.page_size, args.max_pages).await?;
+        let mut unread = 0;
+        let mut unknown_read = 0;
+        let mut unsaved = 0;
+        let mut saved = 0;
+        for letter in &inventory.letters {
+            match letter.extra.get("readStatus").and_then(Value::as_str) {
+                Some("UNREAD") => unread += 1,
+                Some("READ") => {}
+                _ => unknown_read += 1,
+            }
+            if let Some(id) = letter.id.as_deref().filter(|id| !id.is_empty()) {
+                if store.contains_saved(id)? {
+                    saved += 1;
+                } else {
+                    unsaved += 1;
                 }
-                Some("awaiting_manual_acceptance_or_status_verification") => {
-                    add("check acceptance or status in ePost, then retry".into())
-                }
-                Some("failed") => add(summary_reason(document["error"].as_str().unwrap_or(""))),
-                Some("deferred_due_to_authentication_failure") => {
-                    add("sign-in failed; retrieval deferred until the next sync".into())
-                }
-                _ => {}
             }
         }
-    }
-    for issue in report["issues"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-    {
-        add(summary_reason(issue));
-    }
-    for inventory in report["inventories"].as_array().into_iter().flatten() {
-        for issue in inventory["issues"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-        {
-            add(summary_reason(issue));
-        }
-    }
-    let mut lines: Vec<_> = reasons
-        .into_iter()
-        .map(|(reason, count)| format!("Attention ({count}): {reason}."))
-        .collect();
-    if report["pagination_complete"] == false {
-        lines.push("Inventory is incomplete. Check missing folders/documents in ePost; retrying may resolve temporary failures.".into());
-    }
-    lines
-}
-
-/// Only known reasons are rendered; provider IDs and arbitrary text stay out of progress.
-fn summary_reason(reason: &str) -> String {
-    if let Some(code) = reason
-        .strip_prefix("provider returned HTTP ")
-        .and_then(|s| s.parse::<u16>().ok())
-    {
-        return if code == 404 {
-            "provider returned HTTP 404; check unavailable documents in ePost".into()
+        let complete = inventory.pagination_complete;
+        let has_new = if unsaved > 0 {
+            Some(true)
+        } else if complete {
+            Some(false)
         } else {
-            format!("provider returned HTTP {code}; retry or inspect the detailed report")
+            None
         };
+        let has_unread = if unread > 0 {
+            Some(true)
+        } else if complete && unknown_read == 0 {
+            Some(false)
+        } else {
+            None
+        };
+        let needed = if has_new == Some(true) || has_unread == Some(true) {
+            Some(true)
+        } else if has_new == Some(false) && has_unread == Some(false) {
+            Some(false)
+        } else {
+            None
+        };
+        let code = if inventory.failure_exit_code == Some(3) {
+            3
+        } else if !complete || unknown_read > 0 {
+            2
+        } else {
+            0
+        };
+        let mut issues = inventory.issues;
+        if unknown_read > 0 {
+            issues.push("some inbox items have missing or unknown read status".into());
+        }
+        (
+            json!({
+                "mode": "metadata_and_local_store", "inbox_documents": inventory.letters.len(),
+                "unread_count": unread, "unknown_read_status_count": unknown_read,
+                "new_documents_count": unsaved, "already_saved_count": saved,
+                "has_unread": has_unread, "has_new": has_new, "sync_needed": needed,
+                "pages": inventory.pages, "pagination_complete": complete,
+                "mailbox_coverage_verified": false, "issues": issues,
+            }),
+            code,
+        )
+    };
+    report["check_exit_code"] = json!(code);
+    report["sync_requested"] = json!(args.sync_if_needed);
+    report["sync_performed"] = json!(false);
+    if args.sync_if_needed && report["sync_needed"] == true && code != 3 {
+        // Store comparison guard is dropped before opening the sync store.
+        let destination = output(cli, args.output.as_deref())?;
+        let mut reporter = Reporter::new(progress_enabled(cli));
+        let result = sync_with_progress(
+            cli,
+            client,
+            mailbox,
+            &ResolvedSyncArgs {
+                scope: Scope::Inbox,
+                output: destination,
+                page_size: args.page_size,
+                max_pages: args.max_pages,
+            },
+            &mut reporter,
+        )
+        .await;
+        if cli.json || !io::stdout().is_terminal() {
+            reporter.event(Event::Finished {
+                exit_code: match &result {
+                    Ok((_, code)) => *code,
+                    Err(error) => error.exit_code(),
+                },
+            });
+            if progress_enabled(cli)
+                && let Ok((retrieval, _)) = &result
+            {
+                for line in attention_lines(retrieval) {
+                    let _ = writeln!(io::stderr().lock(), "{line}");
+                }
+            }
+        }
+        code = attach_check_sync(&mut report, code, result);
     }
-    match reason {
-        "archive directory has no documented usable selector" => {
-            "archive folder has no API selector; check its documents manually in ePost"
-        }
-        "duplicate archive directory ID" => "duplicate archive folder; inventory is uncertain",
-        "duplicate IDs observed across pages" => {
-            "documents overlapped across pages; inventory is uncertain"
-        }
-        "letter without usable ID" => "document has no usable ID; check it manually in ePost",
-        "maximum page count reached" => "page limit reached; increase --max-pages and retry",
-        "pagination made no progress" => {
-            "pagination made no progress; retry and compare with ePost"
-        }
-        "network request failed or timed out" => "network request failed or timed out; retry",
-        "authentication failed or expired" => "sign-in failed or expired; sign in and retry",
-        _ if reason.contains("safety limit")
-            || reason == "pagination offset exceeded API range" =>
-        {
-            "safety limit reached; inventory is incomplete"
-        }
-        _ if reason.contains("authentication failed during") => {
-            "sign-in failed; some retrieval was deferred"
-        }
-        _ => "retrieval or inventory issue; inspect the detailed JSON report and ePost",
-    }
-    .into()
+    Ok((report, code))
 }
 
-fn sync_summary(report: &Value, code: u8) -> Vec<String> {
-    let documents = report["documents"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    let count = |status: &str| documents.iter().filter(|d| d["status"] == status).count();
-    let mut lines = vec![format!(
-        "Sync: {} new PDFs, {} already saved, {} other formats, {} require action in ePost, {} failed.",
-        count("saved_pdf"),
-        count("already_saved"),
-        count("saved_json") + count("saved_binary"),
-        count("awaiting_manual_acceptance_or_status_verification"),
-        count("failed")
-    )];
-    if code != 0 {
-        lines.push(format!("Sync needs attention (exit {code})."));
+/// Preserve a completed check, including uncertainty, even if its requested
+/// sync fails before producing a retrieval report.
+fn attach_check_sync(report: &mut Value, check_code: u8, result: Result<(Value, u8)>) -> u8 {
+    report["sync_performed"] = json!(true);
+    let sync_code = match result {
+        Ok((retrieval, code)) => {
+            report["sync"] = retrieval;
+            code
+        }
+        Err(error) => {
+            report["sync_error"] = json!(error.to_string());
+            error.exit_code()
+        }
+    };
+    report["sync_exit_code"] = json!(sync_code);
+    check_code.max(sync_code)
+}
+
+fn check_summary(report: &Value, code: u8) -> Vec<String> {
+    let mut lines = if report["mode"] == "unread_count" {
+        vec![format!(
+            "Inbox: {} unread. Unsaved documents were not checked.",
+            report["unread_count"]
+        )]
+    } else {
+        vec![format!(
+            "Inbox: {} unread, {} locally unsaved, {} already saved, {} with unknown read status.",
+            report["unread_count"],
+            report["new_documents_count"],
+            report["already_saved_count"],
+            report["unknown_read_status_count"]
+        )]
+    };
+    if report["sync"].is_object() {
+        lines.extend(sync_summary(
+            &report["sync"],
+            report["sync_exit_code"].as_u64().unwrap_or(2) as u8,
+        ));
+    } else {
+        lines.push(
+            match report["sync_needed"].as_bool() {
+                Some(true) => "Inbox items need attention. Run sync to retrieve unsaved documents.",
+                Some(false) if report["mode"] == "unread_count" => {
+                    "No unread inbox items were observed. Unsaved documents were not checked."
+                }
+                Some(false) => "No unread or unsaved inbox items were observed.",
+                None => "Inbox check is inconclusive; retry or inspect ePost.",
+            }
+            .into(),
+        );
+        lines.push(
+            "Read status is not changed. Counts are observations; mailbox coverage is unverified."
+                .into(),
+        );
     }
-    lines.extend(attention_lines(report));
-    lines.push("Compare with ePost; API pagination cannot prove complete mailbox coverage. Use --json for the detailed report.".into());
+    if code != 0
+        && (report["sync"].is_null() || report["check_exit_code"].as_u64().unwrap_or(0) > 0)
+    {
+        lines.push(format!(
+            "Check/sync needs attention (exit {code}); inspect the detailed report."
+        ));
+    }
     lines
 }
 
@@ -932,6 +1158,9 @@ async fn run(cli: &Cli) -> Result<(Value, u8)> {
         Command::Inbox {
             command: InboxCommand::List(args),
         } => list(&mut client, Source::Inbox, args).await,
+        Command::Inbox {
+            command: InboxCommand::Check(args),
+        } => check_inbox(cli, &mut client, &mailbox, args).await,
         Command::Archive {
             command: ArchiveCommand::Folders,
         } => Ok((value(client.directories().await?)?, 0)),
@@ -1023,6 +1252,11 @@ async fn main() -> std::process::ExitCode {
             Command::Sync(args) if args.scope.is_none() || args.output.is_none() => {
                 Some("sync requires --scope and --output, or a profile saved by setup")
             }
+            Command::Inbox {
+                command: InboxCommand::Check(args),
+            } if args.output.is_none() && (!args.unread_only || args.sync_if_needed) => {
+                Some("inbox check needs --output or a profile, except standalone --unread-only")
+            }
             Command::Download { output: None, .. } => {
                 Some("download requires --output, or a profile saved by setup")
             }
@@ -1088,6 +1322,21 @@ async fn main() -> std::process::ExitCode {
         }
         return code.into();
     }
+    if matches!(
+        cli.command,
+        Command::Inbox {
+            command: InboxCommand::Check(_)
+        }
+    ) && !cli.json
+        && io::stdout().is_terminal()
+    {
+        for line in check_summary(&payload["data"], code) {
+            if writeln!(io::stdout().lock(), "{line}").is_err() {
+                return 1.into();
+            }
+        }
+        return code.into();
+    }
     let rendered = if cli.json {
         serde_json::to_string(&payload)
     } else {
@@ -1108,4 +1357,49 @@ fn print_error(cli: &Cli, error: Error) -> std::process::ExitCode {
     };
     let _ = writeln!(io::stderr().lock(), "{diagnostic}");
     code.into()
+}
+
+#[cfg(test)]
+mod check_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_conditional_sync_preserves_the_completed_partial_check() {
+        let mut report = json!({"has_new":true,"pagination_complete":false,"check_exit_code":2});
+        let exit = attach_check_sync(&mut report, 2, Err(Error::Network));
+        assert_eq!(exit, 2);
+        assert_eq!(report["has_new"], true);
+        assert_eq!(report["pagination_complete"], false);
+        assert_eq!(report["sync_exit_code"], 1);
+        assert_eq!(report["sync_error"], "network request failed or timed out");
+        assert!(
+            check_summary(&report, exit)
+                .iter()
+                .any(|s| s.contains("Check/sync needs attention (exit 2)"))
+        );
+        let exit = attach_check_sync(
+            &mut report,
+            2,
+            Err(Error::Storage("saved document is corrupt")),
+        );
+        assert_eq!(exit, 4);
+    }
+
+    #[test]
+    fn successful_conditional_sync_does_not_hide_check_uncertainty() {
+        let mut report = json!({"check_exit_code":2});
+        let exit = attach_check_sync(
+            &mut report,
+            2,
+            Ok((json!({"documents":[],"pagination_complete":true}), 0)),
+        );
+        assert_eq!(exit, 2);
+        let lines = check_summary(&report, exit);
+        assert!(
+            lines
+                .iter()
+                .any(|s| s.contains("Check/sync needs attention (exit 2)"))
+        );
+        assert_eq!(report["sync_exit_code"], 0);
+    }
 }

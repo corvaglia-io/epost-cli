@@ -650,25 +650,83 @@ async fn guided_sync_explains_inventory_failures_document_errors_and_cached_json
         .expect(1)
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/epost/v2/letters/synthetic-failed-content"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
     let mut answers = Answers::new(&["3", "yes", "q"]);
     assert_eq!(interactive::run(&cli, &mut answers).await.unwrap(), 2);
     let text = answers.text();
     assert!(text.contains("Sync needs attention"));
     assert!(text.contains("provider returned HTTP 500"));
-    assert!(text.contains("provider returned HTTP 404"));
-    assert!(text.contains("duplicate IDs observed across pages"));
+    assert!(text.contains("document metadata and content returned HTTP 404"));
+    assert!(text.contains("documents overlapped across pages"));
     assert!(text.contains("synthetic-cached-json: already_saved (json)"));
     assert!(text.contains("synthetic-failed-content: failed"));
     assert!(!text.contains("synthetic-private-inventory-body"));
     assert!(!text.contains("synthetic-private-content-body"));
     assert_eq!(answers.credential_calls, 1);
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 5);
+    assert_eq!(requests.len(), 6);
     assert!(
         !requests
             .iter()
             .any(|request| request.url.path() == "/epost/v2/letters/synthetic-cached-json/content")
     );
+    assert_read_only(&requests);
+    answers.assert_safe();
+}
+
+#[tokio::test]
+async fn numbered_download_explains_unavailable_content_without_echoing_message_metadata() {
+    let server = MockServer::start().await;
+    let temp = scratch();
+    standard_auth(&server).await;
+    let id = "synthetic-numbered-message";
+    inbox(
+        &server,
+        json!([{ "id": id, "letterTitle": "Invented short message" }]),
+        1,
+    )
+    .await;
+    letter(
+        &server,
+        id,
+        json!({
+            "id": id,
+            "letterType": "SIMPLE_SHORT_MESSAGE",
+            "documentMessage": "synthetic-private-message-never-echo",
+        }),
+        2,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/epost/v2/letters/{id}/content")))
+        .respond_with(
+            ResponseTemplate::new(404).set_body_string("synthetic-private-body-never-echo"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cli = profile_cli(&server, temp.path(), &[]);
+    let mut answers = Answers::new(&["1", "1", "q"]);
+    assert_eq!(interactive::run(&cli, &mut answers).await.unwrap(), 2);
+    let text = answers.text();
+    assert!(text.contains("Download unavailable; no content was saved."));
+    assert!(text.contains("Download needs attention: message exists in letter metadata, but downloadable content is unavailable; review it in ePost."));
+    assert!(!text.contains("synthetic-private-message-never-echo"));
+    assert!(!text.contains("synthetic-private-body-never-echo"));
+    let selected_mailbox = mailbox(&cli).unwrap();
+    let mut store = Store::open(
+        &temp.path().join("documents"),
+        &namespace(&cli, &selected_mailbox).unwrap(),
+    )
+    .unwrap();
+    assert!(store.verify_existing(id, "inbox").unwrap().is_none());
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 6);
     assert_read_only(&requests);
     answers.assert_safe();
 }
