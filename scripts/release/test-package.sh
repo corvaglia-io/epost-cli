@@ -67,7 +67,7 @@ archive="$output/$name.tar.gz"
 checksum="$archive.sha256"
 [[ -f "$archive" && -f "$checksum" ]] || fail 'release files are missing'
 tar -tzf "$archive" | sort > "$temporary/actual-contents"
-printf '%s\n' "$name/" "$name/LICENSE" "$name/README.md" "$name/epost-cli" |
+printf '%s\n' "$name/" "$name/LICENSE" "$name/README.md" "$name/epost-cli" "$name/epost" |
     sort > "$temporary/expected-contents"
 cmp "$temporary/expected-contents" "$temporary/actual-contents" ||
     fail 'archive contains unexpected entries'
@@ -80,6 +80,8 @@ tar -xzf "$archive" -C "$temporary/extracted"
 [[ $(mode_of "$temporary/extracted/$name/README.md") == 644 ]] ||
     fail 'packaged README mode is not 0644'
 cmp "$fixture" "$temporary/extracted/$name/epost-cli" || fail 'binary changed'
+cmp "$fixture" "$temporary/extracted/$name/epost" || fail 'short command changed'
+[[ $(mode_of "$temporary/extracted/$name/epost") == 755 ]] || fail 'short command is not executable'
 cmp "$repository/LICENSE" "$temporary/extracted/$name/LICENSE" || fail 'LICENSE changed'
 cmp "$repository/README.md" "$temporary/extracted/$name/README.md" || fail 'README changed'
 read -r recorded_hash recorded_name < "$checksum"

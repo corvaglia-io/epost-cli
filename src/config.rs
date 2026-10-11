@@ -61,6 +61,8 @@ pub struct Profile {
 #[serde(deny_unknown_fields)]
 struct Document {
     schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_profile: Option<String>,
     #[serde(deserialize_with = "unique_profiles")]
     profiles: BTreeMap<String, Profile>,
 }
@@ -69,6 +71,7 @@ impl Default for Document {
     fn default() -> Self {
         Self {
             schema_version: 1,
+            default_profile: None,
             profiles: BTreeMap::new(),
         }
     }
@@ -132,6 +135,59 @@ pub fn profile_exists(path: &Path, name: &str) -> Result<bool> {
     Ok(decode(&raw)?.profiles.contains_key(name))
 }
 
+/// List validated saved profiles in name order without creating files.
+/// A missing file or parent yields an empty list; unsafe or corrupt files fail.
+pub fn list_profiles(path: &Path) -> Result<Vec<(String, Profile)>> {
+    Ok(read_document(path)?
+        .unwrap_or_default()
+        .profiles
+        .into_iter()
+        .collect())
+}
+
+/// Resolve a saved default, or the sole profile in a legacy configuration.
+/// Never choose between several profiles without an explicitly saved default.
+pub fn default_profile(path: &Path) -> Result<Option<String>> {
+    let Some(document) = read_document(path)? else {
+        return Ok(None);
+    };
+    Ok(document.default_profile.or_else(|| {
+        (document.profiles.len() == 1)
+            .then(|| document.profiles.into_keys().next())
+            .flatten()
+    }))
+}
+
+/// Select an existing profile under the same lock and atomic save safeguards.
+pub fn set_default_profile(path: &Path, name: &str) -> Result<()> {
+    validate_name(name)?;
+    edit_document(
+        path,
+        false,
+        |document| {
+            if !document.profiles.contains_key(name) {
+                return Err(Error::Config("profile does not exist; run setup first"));
+            }
+            document.default_profile = Some(name.to_owned());
+            Ok(())
+        },
+        || Ok(()),
+        |_| Ok(()),
+    )
+}
+
+fn read_document(path: &Path) -> Result<Option<Document>> {
+    let (parent, filename) = split_path(path)?;
+    let Some(directory) = ConfigDirectory::open(parent, false)? else {
+        return Ok(None);
+    };
+    directory
+        .read_optional(filename)?
+        .as_deref()
+        .map(decode)
+        .transpose()
+}
+
 /// Preserve every existing profile; never overwrite corrupt configuration.
 pub fn save_profile(path: &Path, name: &str, profile: &Profile) -> Result<()> {
     save_inner(path, name, profile, None, || Ok(()), |_| Ok(()))
@@ -181,27 +237,49 @@ fn save_inner<T>(
 ) -> Result<()> {
     validate_name(name)?;
     validate_profile(profile)?;
+    edit_document(
+        path,
+        true,
+        |document| {
+            if expected.is_some_and(|expected| document.profiles.get(name) != expected) {
+                return Err(Error::Config(
+                    "profile changed since it was reviewed; run setup again",
+                ));
+            }
+            if document.default_profile.is_none() {
+                document.default_profile = Some(name.to_owned());
+            }
+            document.profiles.insert(name.to_owned(), profile.clone());
+            Ok(())
+        },
+        effect,
+        rollback,
+    )
+}
+
+fn edit_document<T>(
+    path: &Path,
+    create: bool,
+    edit: impl FnOnce(&mut Document) -> Result<()>,
+    effect: impl FnOnce() -> Result<T>,
+    rollback: impl FnOnce(T) -> Result<()>,
+) -> Result<()> {
     let (parent, filename) = split_path(path)?;
-    let directory = ConfigDirectory::open(parent, true)?.ok_or(Error::Config(
-        "configuration directory could not be created",
-    ))?;
+    let directory = ConfigDirectory::open(parent, create)?
+        .ok_or(Error::Config("profile does not exist; run setup first"))?;
     let mut lock_name = OsString::from(".");
     lock_name.push(filename);
     lock_name.push(".lock");
     let lock = directory.open_file(&lock_name, true)?;
     FileExt::try_lock_exclusive(&lock)
         .map_err(|_| Error::Config("configuration is being saved by another run; retry shortly"))?;
+    let _writer_lock = WriterLock(lock);
     let previous = directory.read_optional(filename)?;
     let mut document = match previous.as_deref() {
         Some(raw) => decode(raw)?,
         None => Document::default(),
     };
-    if expected.is_some_and(|expected| document.profiles.get(name) != expected) {
-        return Err(Error::Config(
-            "profile changed since it was reviewed; run setup again",
-        ));
-    }
-    document.profiles.insert(name.to_owned(), profile.clone());
+    edit(&mut document)?;
     let raw = serde_json::to_vec_pretty(&document)
         .map_err(|_| Error::Config("configuration could not be encoded"))?;
     if raw.len() > MAX_CONFIG_BYTES {
@@ -248,6 +326,14 @@ fn decode(raw: &[u8]) -> Result<Document> {
     for (name, profile) in &document.profiles {
         validate_name(name)?;
         validate_profile(profile)?;
+    }
+    if let Some(name) = &document.default_profile {
+        validate_name(name)?;
+        if !document.profiles.contains_key(name) {
+            return Err(Error::Config(
+                "default profile does not exist; repair the configuration",
+            ));
+        }
     }
     Ok(document)
 }
@@ -359,6 +445,19 @@ fn unique_profiles<'de, D: Deserializer<'de>>(
 
 fn config_io(_: std::io::Error) -> Error {
     Error::Config("local configuration filesystem operation failed")
+}
+
+/// Release the acquired advisory lock before closing its descriptor. Closing
+/// alone can leave a fork-inherited duplicate holding the same lock until the
+/// child execs or exits, even though the parent's configuration save finished.
+/// Construct this guard only after locking succeeds, and retain it through
+/// every commit, rollback and readback path.
+struct WriterLock(File);
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
 }
 
 struct ConfigDirectory {

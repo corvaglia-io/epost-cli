@@ -96,6 +96,12 @@ pub async fn collect_with_progress(
     let mut seen = HashSet::new();
     let mut offset = 0u32;
     for _ in 0..max_pages {
+        if crate::progress::stop_requested() {
+            result
+                .issues
+                .push("stopped before remaining inventory pages".into());
+            return Ok(result);
+        }
         let current_page = result.pages + 1;
         observer(PageProgress::Started {
             page: current_page,

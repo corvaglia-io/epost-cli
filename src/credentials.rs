@@ -80,6 +80,18 @@ pub fn get(
     store.get(&identity(path, name, origin, profile, username)?, ACCOUNT)
 }
 
+/// Resolve the same exact credential identity while suppressing native UI.
+pub fn get_noninteractive(
+    store: &dyn CredentialStore,
+    path: &Path,
+    name: &str,
+    origin: &str,
+    profile: &Profile,
+    username: &str,
+) -> Result<Secret> {
+    store.get_noninteractive(&identity(path, name, origin, profile, username)?, ACCOUNT)
+}
+
 pub fn save(
     store: &dyn CredentialStore,
     path: &Path,
@@ -375,6 +387,7 @@ mod tests {
     struct FakeStore {
         entries: RefCell<HashMap<(String, String), Secret>>,
         calls: Cell<usize>,
+        noninteractive_calls: Cell<usize>,
         deny_get: Cell<bool>,
         fail_next_delete: Cell<bool>,
         fail_set_for: RefCell<Option<String>>,
@@ -392,6 +405,11 @@ mod tests {
                 .get(&(service.to_owned(), account.to_owned()))
                 .cloned()
                 .ok_or(Error::Config(crate::keychain::MISSING_ENTRY_MESSAGE))
+        }
+        fn get_noninteractive(&self, service: &str, account: &str) -> Result<Secret> {
+            self.noninteractive_calls
+                .set(self.noninteractive_calls.get() + 1);
+            self.get(service, account)
         }
         fn set(&self, service: &str, account: &str, password: &Secret) -> Result<()> {
             self.calls.set(self.calls.get() + 1);
@@ -574,6 +592,81 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn noninteractive_helper_uses_the_same_binding_and_dispatches_to_the_store_variant() {
+        let fixture = Fixture::new();
+        let store = FakeStore::default();
+        let password = Secret::new("synthetic-noninteractive-password".to_owned());
+        save(
+            &store,
+            &fixture.path,
+            "personal",
+            ORIGIN,
+            &fixture.profile,
+            USERNAME,
+            &password,
+        )
+        .unwrap();
+        assert_eq!(
+            get_noninteractive(
+                &store,
+                &fixture.path,
+                "personal",
+                ORIGIN,
+                &fixture.profile,
+                USERNAME
+            )
+            .unwrap()
+            .expose(),
+            password.expose()
+        );
+        assert_eq!(store.noninteractive_calls.get(), 1);
+        assert_eq!(
+            store.entries.borrow().keys().next().unwrap(),
+            &(fixture.service(), ACCOUNT.to_owned())
+        );
+        assert!(
+            get_noninteractive(
+                &store,
+                &fixture.path,
+                "other",
+                ORIGIN,
+                &fixture.profile,
+                USERNAME
+            )
+            .is_err()
+        );
+        assert_eq!(store.noninteractive_calls.get(), 2);
+        store.deny_get.set(true);
+        let error = get_noninteractive(
+            &store,
+            &fixture.path,
+            "personal",
+            ORIGIN,
+            &fixture.profile,
+            USERNAME,
+        )
+        .unwrap_err();
+        assert!(!crate::keychain::is_missing(&error));
+        assert!(!error.to_string().contains(password.expose()));
+        let calls = store.calls.get();
+        for name in ["", "../personal", "bad\nname"] {
+            assert!(
+                get_noninteractive(
+                    &store,
+                    &fixture.path,
+                    name,
+                    ORIGIN,
+                    &fixture.profile,
+                    USERNAME
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(store.calls.get(), calls);
+        assert_eq!(store.noninteractive_calls.get(), 3);
     }
 
     #[test]

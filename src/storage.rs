@@ -23,7 +23,31 @@ const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ID_BYTES: usize = 4096;
 const MAX_CONTENT_TYPE_BYTES: usize = 256;
-const PRIVATE_STATE_NAMES: [&str; 2] = ["paperless-target.json", "paperless-delivery.json"];
+const PRIVATE_STATE_NAMES: [&str; 4] = [
+    "paperless-target.json",
+    "paperless-delivery.json",
+    "destinations.json",
+    "source-metadata.json",
+];
+
+/// Minimal optional source facts. This deliberately excludes raw response data,
+/// content references, sender IDs and message bodies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SourceMetadata {
+    pub title: Option<String>,
+    pub original_file_name: Option<String>,
+    pub received_at: Option<String>,
+    pub document_types: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetadataState {
+    schema_version: u32,
+    namespace_hash: String,
+    entries: BTreeMap<String, SourceMetadata>,
+}
 
 /// Secret-free inventory for downstream delivery. Bytes are read separately
 /// through `read_saved`, which verifies the recorded size, digest and format.
@@ -108,10 +132,21 @@ pub struct Store {
     root: Directory,
     namespace_dir: Directory,
     data_dir: Directory,
-    _lock: File,
+    _lock: AcquiredLock,
     manifest: Manifest,
     manifest_sha256: Option<String>,
     private_state_sha256: BTreeMap<String, Option<String>>,
+    #[cfg(unix)]
+    private_state_identity: BTreeMap<String, Option<(u64, u64)>>,
+}
+
+// Explicit unlock releases the owner's advisory lock even if a concurrently
+// spawned child briefly inherited the descriptor before its exec/CLOEXEC.
+struct AcquiredLock(File);
+impl Drop for AcquiredLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
 }
 
 impl Store {
@@ -124,6 +159,7 @@ impl Store {
         private_file(&lock)?;
         FileExt::try_lock_exclusive(&lock)
             .map_err(|_| Error::Storage("store is locked by another run"))?;
+        let lock = AcquiredLock(lock);
         let data_dir = namespace_dir.child("data")?;
         let raw = namespace_dir.read_optional(MANIFEST_NAME, MAX_MANIFEST_BYTES)?;
         let manifest_sha256 = raw.as_deref().map(hash);
@@ -132,6 +168,26 @@ impl Store {
             let state = namespace_dir.read_optional(name, MAX_MANIFEST_BYTES)?;
             private_state_sha256.insert(name.to_owned(), state.as_deref().map(hash));
         }
+        // Discover existing hash-derived ledgers now, while the namespace is
+        // locked and pinned. A file appearing after open must not be adopted.
+        namespace_dir.validate()?;
+        for entry in fs::read_dir(&namespace_dir.path).map_err(Error::Io)? {
+            let entry = entry.map_err(Error::Io)?;
+            if let Some(name) = entry
+                .file_name()
+                .to_str()
+                .filter(|name| allowed_private_state(name))
+            {
+                let state = namespace_dir.read_optional(name, MAX_MANIFEST_BYTES)?;
+                private_state_sha256.insert(name.to_owned(), state.as_deref().map(hash));
+            }
+        }
+        namespace_dir.validate()?;
+        #[cfg(unix)]
+        let private_state_identity = private_state_sha256
+            .keys()
+            .map(|name| Ok((name.clone(), namespace_dir.file_identity(name)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
         let manifest = match raw {
             Some(raw) => serde_json::from_slice::<Manifest>(&raw)
                 .map_err(|_| Error::Storage("manifest is corrupt"))?,
@@ -150,6 +206,8 @@ impl Store {
             manifest,
             manifest_sha256,
             private_state_sha256,
+            #[cfg(unix)]
+            private_state_identity,
         };
         store.validate_manifest(namespace)?;
         Ok(store)
@@ -169,6 +227,90 @@ impl Store {
     /// Stable hash of the exact ePost origin/mailbox namespace.
     pub fn identity_hash(&self) -> &str {
         &self.manifest.namespace_hash
+    }
+
+    pub fn root_path(&self) -> &Path {
+        &self.root.path
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.manifest.namespace
+    }
+
+    pub fn record_metadata(&mut self, letter: &crate::models::Letter) -> Result<()> {
+        let id = letter
+            .id
+            .as_deref()
+            .ok_or(Error::InvalidResponse("letter metadata has no ID"))?;
+        validate_identifier(id)?;
+        let optional_text = |value: Option<&serde_json::Value>| -> Result<Option<String>> {
+            match value {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(serde_json::Value::String(text)) => usable_metadata_text(Some(text)),
+                _ => Err(Error::InvalidResponse("invalid optional letter metadata")),
+            }
+        };
+        let document_types = match letter.extra.get("documentTypes") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Array(values)) if values.len() <= 64 => {
+                let mut types = Vec::new();
+                for value in values {
+                    let text = optional_text(Some(value))?
+                        .ok_or(Error::InvalidResponse("invalid source document type"))?;
+                    types.push(text);
+                }
+                Some(types)
+            }
+            _ => return Err(Error::InvalidResponse("invalid source document types")),
+        };
+        let metadata = SourceMetadata {
+            title: usable_metadata_text(letter.letter_title.as_deref())?,
+            original_file_name: usable_metadata_text(letter.file_name.as_deref())?,
+            received_at: optional_text(letter.extra.get("receivedDateTime"))?,
+            document_types,
+        };
+        validate_source_metadata(&metadata)?;
+        let mut state = self.metadata_state()?;
+        if state.entries.get(id) == Some(&metadata) {
+            return Ok(());
+        }
+        state.entries.insert(id.to_owned(), metadata);
+        if state.entries.len() > 100_000 {
+            return Err(Error::Storage("source metadata exceeds item bound"));
+        }
+        let raw = serde_json::to_vec(&state)
+            .map_err(|_| Error::Storage("source metadata cannot be serialized"))?;
+        self.write_private_state("source-metadata.json", &raw)
+    }
+
+    pub fn source_metadata(&self, id: &str) -> Result<Option<SourceMetadata>> {
+        validate_identifier(id)?;
+        Ok(self.metadata_state()?.entries.get(id).cloned())
+    }
+
+    fn metadata_state(&self) -> Result<MetadataState> {
+        let state = match self.read_private_state("source-metadata.json")? {
+            Some(raw) => serde_json::from_slice::<MetadataState>(&raw)
+                .map_err(|_| Error::Storage("source metadata is corrupt"))?,
+            None => MetadataState {
+                schema_version: 1,
+                namespace_hash: self.identity_hash().to_owned(),
+                entries: BTreeMap::new(),
+            },
+        };
+        if state.schema_version != 1
+            || state.namespace_hash != self.identity_hash()
+            || state.entries.len() > 100_000
+        {
+            return Err(Error::Storage(
+                "source metadata namespace or version is invalid",
+            ));
+        }
+        for (id, metadata) in &state.entries {
+            validate_identifier(id)?;
+            validate_source_metadata(metadata)?;
+        }
+        Ok(state)
     }
 
     pub fn saved_documents(&self) -> Result<Vec<SavedDocument>> {
@@ -214,7 +356,7 @@ impl Store {
         Ok(bytes)
     }
 
-    /// Access only the two fixed, secret-free Paperless state files. The store
+    /// Access fixed secret-free state or controlled hash-derived ledgers. The store
     /// lock, pinned directories and original byte digest guard repeat writes.
     pub fn read_private_state(&self, name: &str) -> Result<Option<Vec<u8>>> {
         self.check_directories()?;
@@ -274,6 +416,9 @@ impl Store {
         // still current or roll back a matching external credential.
         self.private_state_sha256
             .insert(name.to_owned(), Some(hash(bytes)));
+        #[cfg(unix)]
+        self.private_state_identity
+            .insert(name.to_owned(), self.namespace_dir.file_identity(name)?);
         self.namespace_dir.sync()?;
         self.check_directories()?;
         let persisted = self
@@ -287,13 +432,21 @@ impl Store {
     }
 
     fn check_private_state_unchanged(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        let expected = self
-            .private_state_sha256
-            .get(name)
-            .ok_or(Error::Storage("private state filename is not allowed"))?;
+        if !allowed_private_state(name) {
+            return Err(Error::Storage("private state filename is not allowed"));
+        }
+        let expected = self.private_state_sha256.get(name).cloned().flatten();
         let raw = self.namespace_dir.read_optional(name, MAX_MANIFEST_BYTES)?;
-        if &raw.as_deref().map(hash) != expected {
+        if raw.as_deref().map(hash) != expected {
             return Err(Error::Storage("private state changed while store was open"));
+        }
+        #[cfg(unix)]
+        if self.namespace_dir.file_identity(name)?
+            != self.private_state_identity.get(name).copied().flatten()
+        {
+            return Err(Error::Storage(
+                "private state file was replaced while store was open",
+            ));
         }
         Ok(raw)
     }
@@ -519,6 +672,53 @@ impl Store {
     }
 }
 
+fn allowed_private_state(name: &str) -> bool {
+    PRIVATE_STATE_NAMES.contains(&name)
+        || name
+            .strip_prefix("destination-")
+            .and_then(|n| n.strip_suffix(".json"))
+            .is_some_and(valid_hash)
+}
+
+fn usable_metadata_text(value: Option<&str>) -> Result<Option<String>> {
+    match value {
+        None => Ok(None),
+        Some(text) if text.len() > 4096 || text.chars().any(char::is_control) => Err(
+            Error::InvalidResponse("source metadata text exceeds bounds or contains controls"),
+        ),
+        Some(text) if text.trim().is_empty() => Ok(None),
+        Some(text) => Ok(Some(text.to_owned())),
+    }
+}
+
+fn validate_source_metadata(metadata: &SourceMetadata) -> Result<()> {
+    for text in [
+        &metadata.title,
+        &metadata.original_file_name,
+        &metadata.received_at,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if usable_metadata_text(Some(text))?.is_none() {
+            return Err(Error::Storage("source metadata has empty text"));
+        }
+    }
+    if let Some(types) = &metadata.document_types {
+        if types.len() > 64 {
+            return Err(Error::Storage(
+                "source metadata has too many document types",
+            ));
+        }
+        for text in types {
+            if usable_metadata_text(Some(text))?.is_none() {
+                return Err(Error::Storage("source metadata has empty document type"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Returns a conservative descriptive hint from bounded content bytes.
 ///
 /// Magic signatures and text prefixes are not proof that a complete, valid or
@@ -671,6 +871,19 @@ struct Directory {
 }
 
 impl Directory {
+    #[cfg(unix)]
+    fn file_identity(&self, name: &str) -> Result<Option<(u64, u64)>> {
+        use std::os::unix::fs::MetadataExt;
+        let file = match self.open_file(name, false) {
+            Ok(file) => file,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let metadata = file.metadata().map_err(Error::Io)?;
+        Ok(Some((metadata.dev(), metadata.ino())))
+    }
     fn open_root(path: &Path) -> Result<Self> {
         if path.as_os_str().is_empty() {
             return Err(Error::Storage("storage root is empty"));

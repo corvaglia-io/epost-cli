@@ -7,7 +7,7 @@ use epost_cli::{
 };
 use sha2::{Digest, Sha256};
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 pub(super) enum PaperlessCommand {
     /// Verify a token, choose/create delivery tags, and save a secret-free target.
     Setup {
@@ -62,7 +62,7 @@ fn open_store(cli: &Cli, explicit: Option<&Path>) -> Result<(PathBuf, Store)> {
     Ok((root, store))
 }
 
-fn make_client(cli: &Cli, url: &str, token: Secret) -> Result<PaperlessClient> {
+pub(super) fn make_client(cli: &Cli, url: &str, token: Secret) -> Result<PaperlessClient> {
     let options = PaperlessOptions {
         timeout_secs: cli.timeout_seconds,
         max_retries: cli.retries,
@@ -75,9 +75,9 @@ fn make_client(cli: &Cli, url: &str, token: Secret) -> Result<PaperlessClient> {
     }
 }
 
-const TOKEN_SERVICE: &str = "io.corvaglia.epost-cli.paperless";
+pub(super) const TOKEN_SERVICE: &str = "io.corvaglia.epost-cli.paperless";
 
-fn token_account(root: &Path, store: &Store, url: &str) -> Result<String> {
+pub(super) fn token_account(root: &Path, store: &Store, url: &str) -> Result<String> {
     let identity = serde_json::to_vec(&(root, store.identity_hash(), url))
         .map_err(|_| Error::Config("cannot construct Paperless token identity"))?;
     Ok(hex::encode(Sha256::digest(identity)))
@@ -163,7 +163,7 @@ fn persist_with_tokens(
     )
 }
 
-fn file_token(path: &Path) -> Result<Secret> {
+pub(super) fn file_token(path: &Path) -> Result<Secret> {
     use std::fs::OpenOptions;
     if !path.is_absolute() {
         return Err(Error::Config(
@@ -213,7 +213,7 @@ fn file_token(path: &Path) -> Result<Secret> {
     checked_token(text.trim_end_matches(['\r', '\n']).to_owned())
 }
 
-fn checked_token(value: String) -> Result<Secret> {
+pub(super) fn checked_token(value: String) -> Result<Secret> {
     let secret = Secret::new(value);
     if secret.expose().is_empty()
         || secret.expose().len() > 8192
@@ -228,11 +228,19 @@ fn checked_token(value: String) -> Result<Secret> {
     Ok(secret)
 }
 
-fn token(cli: &Cli, root: &Path, store: &Store, target: &PaperlessTarget) -> Result<Secret> {
+pub(super) fn token(
+    cli: &Cli,
+    root: &Path,
+    store: &Store,
+    target: &PaperlessTarget,
+) -> Result<Secret> {
     if cli.password_stdin && matches!(cli.command, Command::Paperless { .. }) {
         return Err(Error::Config(
             "--password-stdin is for ePost; use --paperless-token-file or PAPERLESS_TOKEN",
         ));
+    }
+    if let Some(secret) = &cli.prepared_paperless_token {
+        return Ok(secret.clone());
     }
     if let Some(path) = &cli.paperless_token_file {
         if std::env::var_os("PAPERLESS_TOKEN").is_some() {
@@ -247,13 +255,14 @@ fn token(cli: &Cli, root: &Path, store: &Store, target: &PaperlessTarget) -> Res
     }
     if target.remember_token {
         native_keychain_allowed(cli)?;
-        let secret = keychain::NativeStore.get(TOKEN_SERVICE, &token_account(root, store, &target.url)?)
+        let account = token_account(root, store, &target.url)?;
+        let secret = (if cli.non_interactive { keychain::NativeStore.get_noninteractive(TOKEN_SERVICE,&account) } else { keychain::NativeStore.get(TOKEN_SERVICE,&account) })
             .map_err(|error| if keychain::is_missing(&error) {
                 Error::Config("saved Paperless token was not found; run paperless setup --remember or supply runtime credentials")
             } else { error })?;
         return checked_token(secret.expose().to_owned());
     }
-    if !cli.json && io::stdin().is_terminal() {
+    if !cli.json && !cli.non_interactive && io::stdin().is_terminal() {
         eprintln!("Paperless token: My Profile → API token. This input is hidden.");
         return checked_token(rpassword::prompt_password("Paperless API token: ")?);
     }
@@ -314,6 +323,21 @@ async fn validate_tags(client: &PaperlessClient, target: &PaperlessTarget) -> Re
 }
 
 pub(super) async fn run(cli: &Cli, command: &PaperlessCommand) -> Result<(Value, u8)> {
+    if !matches!(command, PaperlessCommand::Setup { .. }) {
+        let explicit = match command {
+            PaperlessCommand::Upload { output, .. }
+            | PaperlessCommand::Status { output }
+            | PaperlessCommand::Reconcile { output, .. }
+            | PaperlessCommand::Logout { output } => output.as_deref(),
+            _ => None,
+        };
+        let (_, store) = open_store(cli, explicit)?;
+        if store.read_private_state("destinations.json")?.is_some() {
+            return Err(Error::Config(
+                "named destinations are configured; use epost deliver, epost destination list/edit/remove or epost doctor",
+            ));
+        }
+    }
     match command {
         PaperlessCommand::Setup {
             url,
@@ -323,7 +347,7 @@ pub(super) async fn run(cli: &Cli, command: &PaperlessCommand) -> Result<(Value,
             output,
         } => {
             if *remember {
-                native_keychain_allowed(cli)?;
+                native_keychain_mutation_allowed(cli)?;
             }
             let supplied = match url {
                 Some(url) => url.clone(),
@@ -342,8 +366,13 @@ pub(super) async fn run(cli: &Cli, command: &PaperlessCommand) -> Result<(Value,
             };
             let url = normalize_url(&supplied, cli.mock_url.is_some())?;
             let (root, mut store) = open_store(cli, output.as_deref())?;
+            if store.read_private_state("destinations.json")?.is_some() {
+                return Err(Error::Config(
+                    "named destinations are configured; use epost destination edit and epost deliver instead of legacy paperless setup",
+                ));
+            }
             if previous_target(&store)?.is_some_and(|target| target.remember_token) {
-                native_keychain_allowed(cli)?;
+                native_keychain_mutation_allowed(cli)?;
             }
             // A new setup never silently borrows a saved token from another target.
             let mut target = PaperlessTarget {
@@ -403,7 +432,7 @@ pub(super) async fn run(cli: &Cli, command: &PaperlessCommand) -> Result<(Value,
             let (root, mut store) = open_store(cli, output.as_deref())?;
             let mut target = delivery::load_target(&store)?;
             if target.remember_token {
-                native_keychain_allowed(cli)?;
+                native_keychain_mutation_allowed(cli)?;
                 target.remember_token = false;
                 persist_with_tokens(&root, &mut store, &target, None, &keychain::NativeStore)?;
             }
@@ -419,6 +448,11 @@ pub(super) async fn deliver_saved(
     wait_seconds: u32,
 ) -> Result<(Value, u8)> {
     let (root, mut store) = open_store(cli, explicit)?;
+    if store.read_private_state("destinations.json")?.is_some() {
+        return Err(Error::Config(
+            "use epost check inbox or epost deliver for named destinations",
+        ));
+    }
     let target = delivery::load_target(&store)?;
     let client = make_client(cli, &target.url, token(cli, &root, &store, &target)?)?;
     validate_tags(&client, &target).await?;
@@ -441,7 +475,7 @@ pub(super) async fn deliver_saved(
     Ok((value(report)?, code))
 }
 
-fn show_progress(cli: &Cli, event: DeliveryEvent) {
+pub(super) fn show_progress(cli: &Cli, event: DeliveryEvent) {
     if !progress_enabled(cli) {
         return;
     }
@@ -453,14 +487,13 @@ fn show_progress(cli: &Cli, event: DeliveryEvent) {
         DeliveryPhase::Reconciling => "checking earlier upload",
         DeliveryPhase::Finished => "finished",
     };
-    let _ = writeln!(
-        io::stderr().lock(),
+    let line = format!(
         "Paperless: {phase} ({}/{}, {} verified, {} need attention)",
-        event.processed,
-        event.total,
-        event.delivered,
-        event.attention
+        event.processed, event.total, event.delivered, event.attention
     );
+    if !epost_cli::progress::publish_line(&line) {
+        let _ = writeln!(io::stderr().lock(), "{line}");
+    }
 }
 
 pub(super) fn summary(report: &Value, code: u8) -> Vec<String> {

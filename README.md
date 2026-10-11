@@ -4,6 +4,24 @@ An unofficial Rust CLI and library for retrieving documents from a private or bu
 
 This client is tested against synthetic localhost servers. **Provider compatibility and complete mailbox coverage remain unverified.** The project is independent of ePost, KLARA and Swiss Post and offers no guarantee of availability or correctness.
 
+## Start here
+
+```sh
+epost                         # Ratatui menu and onboarding
+epost destination add         # optional Paperless/folder destination
+epost check inbox             # fetch new mail and deliver to all destinations
+epost doctor                  # diagnose access and pending work
+epost --non-interactive --json check inbox  # scheduler/agent use after setup
+```
+
+`epost-cli` remains an equivalent executable name. On terminals, commands show
+live progress and a lasting text summary; pipes use plain text, and `--json`
+provides structured results. The saved default profile supplies account settings
+and Keychain preferences. **Every configured destination is used by default**;
+repeat `--destination NAME` to restrict one run, or use `--local` for local retrieval.
+See the [command map and migration guide](docs/commands.md) for setup,
+multiple accounts, verified folder copies, resuming delivery and Doctor.
+
 ## Scope
 
 - Explicit private/business mailbox selection and tenant discovery.
@@ -15,7 +33,7 @@ This client is tested against synthetic localhost servers. **Provider compatibil
 - JSON reports and nonzero exit codes suitable for scripts, agents, n8n or Dagu.
 - Opt-in delivery of locally verified PDFs to Paperless-ngx, with an inbox review tag, resumable ingestion and original-byte verification.
 
-ePost mail operations are read-only. The client does not accept/reject registered letters, mark letters read, move/archive, send, upload, restore or delete ePost mail. Authentication uses the documented POST endpoints. Paperless delivery is a separate, explicitly enabled destination. Downloading or delivering a document does not perform required manual acceptance or act on its contents.
+ePost mail operations are read-only. The client does not accept/reject registered letters, mark letters read, move/archive, send, upload, restore or delete ePost mail. Authentication uses the documented POST endpoints. Paperless delivery is a separately configured destination; the new check routine uses all configured destinations, while legacy sync remains opt-in. Downloading or delivering a document does not perform required manual acceptance or act on its contents.
 
 ## Build and install
 
@@ -36,7 +54,7 @@ The toolchain and declared minimum Rust version are 1.98.0. Development is verif
 
 Release CI builds macOS and Linux archives for x86-64 and ARM64. A tag such as `v0.1.0` must match `Cargo.toml` and point to a commit merged into `main`. After checks and all four builds succeed, the workflow creates a GitHub release containing the archives and `SHA256SUMS`. PR/manual runs build preview artifacts without creating a release. Archives become available when a maintainer pushes a matching version tag after merging the release workflow; source builds remain available.
 
-Choose your platform archive from [GitHub Releases](https://github.com/corvaglia-io/epost-cli/releases), verify its checksum, then extract and run the included binary. Each archive contains `epost-cli`, `README.md` and `LICENSE`. Linux builds use glibc on Ubuntu 22.04 and are not static/Alpine binaries. macOS binaries are unsigned and not notarized. No Windows binary, crate or container image is published. See [release instructions](docs/releases.md) for platform names, verification and maintainer steps.
+Choose your platform archive from [GitHub Releases](https://github.com/corvaglia-io/epost-cli/releases), verify its checksum, then extract and run the included binary. Each archive contains `epost`, `epost-cli`, `README.md` and `LICENSE`. Linux builds use glibc on Ubuntu 22.04 and are not static/Alpine binaries. macOS binaries are unsigned and not notarized. No Windows binary, crate or container image is published. See [release instructions](docs/releases.md) for platform names, verification and maintainer steps.
 
 ## Authentication and mailbox selection
 
@@ -73,7 +91,7 @@ Keychain storage is local and not synchronized through iCloud. Entries are bound
 
 On another OS, `login` without `--remember` can convert a copied Mac profile to username-only prompting after successful sign-in. It cannot delete the saved password on the original Mac; use `logout` there if required.
 
-A selected profile supplies mailbox identity and environment. Explicit identity/environment flags cannot be combined with it. Download and sync may override the saved destination with `--output`; sync may override the saved scope with `--scope`. Without a profile, the existing explicit flags are required. Existing script commands retain their JSON reports; guided commands write their readable interface to stderr and reject `--json`/`--password-stdin`.
+A selected profile supplies mailbox identity and environment. Explicit identity/environment flags cannot be combined with it. Download and sync may override the saved destination with `--output`; sync may override the saved scope with `--scope`. Without a profile, the existing explicit flags are required. Existing script commands retain their structured reports when `--json` is supplied; guided commands write their readable interface to stderr and reject `--json`/`--password-stdin`.
 
 ### Paperless delivery
 
@@ -170,7 +188,7 @@ epost-cli --json --tenant-kind private --tenant-id example-tenant --company-id 0
 
 ## Output and exit codes
 
-Script commands use pretty-printed JSON by default; `--json` emits compact JSON. Standalone sync displays a readable summary when stdout is a terminal and `--json` is absent; redirected stdout retains the JSON report. Help and version are ordinary text. When structured output is selected, successful and partial commands write one report to stdout:
+Commands use readable text by default, including redirected output; `--json` selects compact structured JSON. Capable terminals show live Ratatui progress and restore the terminal before the lasting summary. Help and version are ordinary text. When structured output is selected, successful and partial commands write one report to stdout:
 
 ```json
 {"schema_version":1,"status":"ok","data":{"source":{"type":"inbox"},"letters":[],"pagination_complete":true,"pages":1,"issues":[]}}
@@ -194,7 +212,7 @@ For reports with multiple failures, storage integrity takes precedence over auth
 
 Sync reports include inventory counts/issues, `pagination_complete`, individual document statuses, and `mailbox_coverage_verified: false`. Saved-document records expose path, SHA-256, byte count, media kind and original `content_type` (null if absent); repeat runs retain the original type. Optional `format_hint` describes a byte signature (PDF, PNG, JPEG, TIFF, GIF, ZIP, HTML or text) on new content and verified cached files. It does not validate or convert the format, change stored filenames or manifest records, or make non-PDF retrieval supported. Document statuses include `saved_pdf`, `saved_json`, `saved_binary`, `already_saved`, `awaiting_manual_acceptance_or_status_verification`, `failed`, and `deferred_due_to_authentication_failure`. JSON/binary content is preserved but counts as unsupported retrieval (exit 2), including on repeat runs. Pending/unknown registered-letter states remain partial even if previously cached content exists.
 
-Save the report somewhere private and configure your automation engine to alert on **every nonzero exit**, including exit 2. A successful download alone is insufficient evidence that all mail has been noticed or acted on. Scheduling, notifications and Paperless ingestion are outside this version.
+Save the report somewhere private and configure your automation engine to alert on **every nonzero exit**, including exit 2. A successful download alone is insufficient evidence that all mail has been noticed or acted on. Scheduling and notifications remain external; configured Paperless ingestion and verified folder copies are supported.
 
 ## Storage and request limits
 

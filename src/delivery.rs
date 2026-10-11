@@ -4,8 +4,12 @@
 //! later run searches the deterministic filename and verifies original bytes;
 //! it never blindly sends the PDF again. Delivery changes no ePost state.
 
+use crate::destinations::{
+    CredentialBinding, Destination, DestinationKind, DocumentTypePolicy, MetadataValue,
+    PaperlessDestination, SourceField, destination_identity, ledger_name, validate_destination,
+};
 use crate::error::{Error, Result};
-use crate::paperless::{PaperlessClient, TaskStatus, normalize_url};
+use crate::paperless::{PaperlessClient, TaskStatus, UploadMetadata, normalize_url};
 use crate::storage::{SavedDocument, Store};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -31,6 +35,44 @@ pub struct DeliveryOptions {
     pub max_documents: usize,
     pub poll_attempts: u32,
     pub poll_interval_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NamedDeliveryOptions {
+    pub delivery: DeliveryOptions,
+    pub audit: bool,
+}
+
+#[derive(Default)]
+struct DeliveryContext {
+    ledger_name: String,
+    destination_identity: Option<String>,
+    config: Option<PaperlessDestination>,
+    cached_verified: bool,
+    verify_only: bool,
+}
+
+impl DeliveryContext {
+    fn legacy() -> Self {
+        Self {
+            ledger_name: LEDGER_NAME.into(),
+            ..Default::default()
+        }
+    }
+    fn named(store: &Store, destination: &Destination, audit: bool) -> Result<Self> {
+        validate_destination(destination)?;
+        let DestinationKind::Paperless(config) = &destination.kind else {
+            return Err(Error::Config("destination is not Paperless"));
+        };
+        Ok(Self {
+            ledger_name: ledger_name(destination),
+            destination_identity: (destination.credential_binding == CredentialBinding::Named)
+                .then(|| destination_identity(store, destination)),
+            config: Some(config.clone()),
+            cached_verified: !audit,
+            verify_only: false,
+        })
+    }
 }
 
 impl Default for DeliveryOptions {
@@ -68,6 +110,7 @@ pub struct DeliveryEvent {
 pub enum DeliveryItemStatus {
     Delivered,
     AlreadyDelivered,
+    PreviouslyConfirmed,
     Pending,
     Uncertain,
     Failed,
@@ -94,6 +137,7 @@ pub struct DeliveryItem {
 pub struct DeliveryReport {
     pub delivered: usize,
     pub already_delivered: usize,
+    pub previously_confirmed: usize,
     pub pending: usize,
     pub uncertain: usize,
     pub failed: usize,
@@ -102,12 +146,14 @@ pub struct DeliveryReport {
     pub not_attempted: usize,
     pub authentication_failed: bool,
     pub access_blocked: bool,
+    pub cancelled: bool,
     pub items: Vec<DeliveryItem>,
 }
 
 impl DeliveryReport {
     pub fn has_attention(&self) -> bool {
-        self.authentication_failed
+        self.cancelled
+            || self.authentication_failed
             || self.access_blocked
             || self.pending
                 + self.uncertain
@@ -124,6 +170,7 @@ impl DeliveryReport {
         match item.status {
             DeliveryItemStatus::Delivered => self.delivered += 1,
             DeliveryItemStatus::AlreadyDelivered => self.already_delivered += 1,
+            DeliveryItemStatus::PreviouslyConfirmed => self.previously_confirmed += 1,
             DeliveryItemStatus::Pending => self.pending += 1,
             DeliveryItemStatus::Uncertain => self.uncertain += 1,
             DeliveryItemStatus::Failed => self.failed += 1,
@@ -139,7 +186,7 @@ impl DeliveryReport {
             phase,
             processed: self.items.len(),
             total,
-            delivered: self.delivered + self.already_delivered,
+            delivered: self.delivered + self.already_delivered + self.previously_confirmed,
             attention: self.pending
                 + self.uncertain
                 + self.failed
@@ -167,6 +214,8 @@ struct Ledger {
     schema_version: u32,
     namespace_hash: String,
     url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    destination_identity: Option<String>,
     entries: BTreeMap<String, DeliveryRecord>,
 }
 
@@ -252,6 +301,59 @@ pub async fn deliver(
     client: &PaperlessClient,
     target: &PaperlessTarget,
     options: DeliveryOptions,
+    progress: impl FnMut(DeliveryEvent),
+) -> Result<DeliveryReport> {
+    deliver_inner(
+        store,
+        client,
+        target,
+        options,
+        &DeliveryContext::legacy(),
+        progress,
+    )
+    .await
+}
+
+pub async fn deliver_paperless(
+    store: &mut Store,
+    client: &PaperlessClient,
+    destination: &Destination,
+    options: NamedDeliveryOptions,
+    progress: impl FnMut(DeliveryEvent),
+) -> Result<DeliveryReport> {
+    let context = DeliveryContext::named(store, destination, options.audit)?;
+    let target = &context
+        .config
+        .as_ref()
+        .expect("named context has configuration")
+        .target;
+    deliver_inner(store, client, target, options.delivery, &context, progress).await
+}
+
+/// Audit retained records without submitting any unrecorded local PDF.
+pub async fn verify_paperless(
+    store: &mut Store,
+    client: &PaperlessClient,
+    destination: &Destination,
+    options: DeliveryOptions,
+    progress: impl FnMut(DeliveryEvent),
+) -> Result<DeliveryReport> {
+    let mut context = DeliveryContext::named(store, destination, true)?;
+    context.verify_only = true;
+    let target = &context
+        .config
+        .as_ref()
+        .expect("named context has configuration")
+        .target;
+    deliver_inner(store, client, target, options, &context, progress).await
+}
+
+async fn deliver_inner(
+    store: &mut Store,
+    client: &PaperlessClient,
+    target: &PaperlessTarget,
+    options: DeliveryOptions,
+    context: &DeliveryContext,
     mut progress: impl FnMut(DeliveryEvent),
 ) -> Result<DeliveryReport> {
     validate_client(client, target)?;
@@ -267,12 +369,22 @@ pub async fn deliver(
     if documents.len() > MAX_ITEMS {
         return Err(Error::Storage("Paperless inventory exceeds its item limit"));
     }
-    let mut ledger = load_ledger(store, target)?;
+    let mut ledger = load_ledger_for(store, target, context)?;
     let mut report = DeliveryReport::default();
     let mut work_count = 0;
     progress(report.event(DeliveryPhase::Started, documents.len()));
     for document in &documents {
         let reference = document_ref(store, &document.letter_id);
+        if context.config.is_some() && crate::progress::stop_requested() {
+            report.cancelled = true;
+            report.add(item(
+                &reference,
+                DeliveryItemStatus::NotAttempted,
+                None,
+                Some("delivery stopped at a safe boundary; run again to continue"),
+            ));
+            continue;
+        }
         if report.authentication_failed || report.access_blocked {
             report.add(item(&reference, DeliveryItemStatus::NotAttempted, None,
                 Some(if report.authentication_failed {
@@ -288,6 +400,15 @@ pub async fn deliver(
                 DeliveryItemStatus::Unsupported,
                 None,
                 Some("only validated PDF files are supported for Paperless delivery"),
+            ));
+            continue;
+        }
+        if context.verify_only && !ledger.entries.contains_key(&reference) {
+            report.add(item(
+                &reference,
+                DeliveryItemStatus::NotAttempted,
+                None,
+                Some("this PDF has not been submitted to the destination; run check to deliver it"),
             ));
             continue;
         }
@@ -310,19 +431,42 @@ pub async fn deliver(
         // Verify local bytes on every run before any remote operation, including
         // already-confirmed deliveries and reconciliation after an interruption.
         let bytes = store.read_saved(&document.letter_id)?;
+        if context.cached_verified
+            && let Some(DeliveryRecord {
+                state: DeliveryState::Verified { document_id },
+                ..
+            }) = ledger.entries.get(&reference)
+        {
+            report.add(item(
+                &reference,
+                DeliveryItemStatus::PreviouslyConfirmed,
+                Some(*document_id),
+                None,
+            ));
+            continue;
+        }
         let record = match ledger.entries.get(&reference).cloned() {
             Some(record) => record,
             None => {
                 let record = DeliveryRecord {
                     sha256: document.sha256.clone(),
                     bytes: document.bytes,
-                    filename: upload_filename(store, document),
+                    filename: upload_filename_for(store, document, context),
                     state: DeliveryState::Uploading,
                 };
-                let tags: Vec<i64> = std::iter::once(target.inbox_tag_id)
-                    .chain(target.source_tag_id)
-                    .collect();
-                if let Err(error) = client.validate_upload(&record.filename, &bytes, &tags) {
+                let metadata = upload_metadata(store, document, target, context)?;
+                if let Err(error) =
+                    client.validate_upload_metadata(&record.filename, &bytes, &metadata)
+                {
+                    report.add(item_error(
+                        &reference,
+                        DeliveryItemStatus::Failed,
+                        None,
+                        &error,
+                    ));
+                    continue;
+                }
+                if let Err(error) = validate_configured_metadata(client, context).await {
                     report.add(item_error(
                         &reference,
                         DeliveryItemStatus::Failed,
@@ -332,9 +476,12 @@ pub async fn deliver(
                     continue;
                 }
                 ledger.entries.insert(reference.clone(), record.clone());
-                persist(store, LEDGER_NAME, &ledger)?;
+                persist(store, &context.ledger_name, &ledger)?;
                 progress(report.event(DeliveryPhase::Uploading, documents.len()));
-                match client.upload_pdf(&record.filename, bytes, &tags).await {
+                match client
+                    .upload_pdf_with_metadata(&record.filename, bytes, &metadata)
+                    .await
+                {
                     Ok(task_id) => {
                         if !valid_task_id(&task_id) {
                             report.add(item(&reference, DeliveryItemStatus::Uncertain, None,
@@ -346,7 +493,7 @@ pub async fn deliver(
                             ..record
                         };
                         ledger.entries.insert(reference.clone(), pending.clone());
-                        persist(store, LEDGER_NAME, &ledger)?;
+                        persist(store, &context.ledger_name, &ledger)?;
                         pending
                     }
                     Err(error) => {
@@ -386,9 +533,9 @@ pub async fn deliver(
                     client,
                     target,
                     &mut ledger,
-                    &reference,
                     document,
                     &record,
+                    context,
                 )
                 .await?
             }
@@ -401,6 +548,10 @@ pub async fn deliver(
                 );
                 let mut task_missing = false;
                 for attempt in 0..options.poll_attempts {
+                    if context.config.is_some() && crate::progress::stop_requested() {
+                        report.cancelled = true;
+                        break;
+                    }
                     if attempt != 0 && options.poll_interval_ms != 0 {
                         tokio::time::sleep(Duration::from_millis(options.poll_interval_ms)).await;
                     }
@@ -437,16 +588,16 @@ pub async fn deliver(
                                 ..record.clone()
                             };
                             ledger.entries.insert(reference.clone(), failed.clone());
-                            persist(store, LEDGER_NAME, &ledger)?;
+                            persist(store, &context.ledger_name, &ledger)?;
                             progress(report.event(DeliveryPhase::Reconciling, documents.len()));
                             result = reconcile_record(
                                 store,
                                 client,
                                 target,
                                 &mut ledger,
-                                &reference,
                                 document,
                                 &failed,
+                                context,
                             )
                             .await?;
                             break;
@@ -459,17 +610,31 @@ pub async fn deliver(
                                     client,
                                     target,
                                     &mut ledger,
-                                    &reference,
                                     document,
                                     &record,
+                                    context,
                                 )
                                 .await?;
                                 break;
                             };
                             progress(report.event(DeliveryPhase::Verifying, documents.len()));
-                            match verify_new_document(client, target, document_id, document).await {
+                            match verify_new_document_for(
+                                client,
+                                target,
+                                document_id,
+                                document,
+                                context,
+                            )
+                            .await
+                            {
                                 Ok(()) => {
-                                    mark_verified(store, &mut ledger, &reference, document_id)?;
+                                    mark_verified_for(
+                                        store,
+                                        &mut ledger,
+                                        &reference,
+                                        document_id,
+                                        context,
+                                    )?;
                                     result = item(
                                         &reference,
                                         DeliveryItemStatus::Delivered,
@@ -497,9 +662,9 @@ pub async fn deliver(
                         client,
                         target,
                         &mut ledger,
-                        &reference,
                         document,
                         &record,
+                        context,
                     )
                     .await?;
                 }
@@ -582,10 +747,12 @@ async fn reconcile_record(
     client: &PaperlessClient,
     target: &PaperlessTarget,
     ledger: &mut Ledger,
-    reference: &str,
     document: &SavedDocument,
     record: &DeliveryRecord,
+    context: &DeliveryContext,
 ) -> Result<DeliveryItem> {
+    let reference = document_ref(store, &document.letter_id);
+    let reference = reference.as_str();
     let failure_status = if matches!(record.state, DeliveryState::TaskFailed { .. }) {
         DeliveryItemStatus::Failed
     } else {
@@ -631,7 +798,8 @@ async fn reconcile_record(
         [document_id] => {
             // The original was already checked above; avoid downloading it a
             // second time merely to check the review queue metadata.
-            if let Err(error) = verify_review_tags(client, target, *document_id).await {
+            if let Err(error) = verify_review_tags_for(client, target, *document_id, context).await
+            {
                 return Ok(item_error(
                     reference,
                     failure_status,
@@ -639,7 +807,7 @@ async fn reconcile_record(
                     &error,
                 ));
             }
-            mark_verified(store, ledger, reference, *document_id)?;
+            mark_verified_for(store, ledger, reference, *document_id, context)?;
             Ok(item(
                 reference,
                 DeliveryItemStatus::Delivered,
@@ -682,14 +850,25 @@ async fn verify_new_document(
     id: i64,
     local: &SavedDocument,
 ) -> Result<()> {
-    verify_original(client, id, local).await?;
-    verify_review_tags(client, target, id).await
+    verify_new_document_for(client, target, id, local, &DeliveryContext::legacy()).await
 }
 
-async fn verify_review_tags(
+async fn verify_new_document_for(
     client: &PaperlessClient,
     target: &PaperlessTarget,
     id: i64,
+    local: &SavedDocument,
+    context: &DeliveryContext,
+) -> Result<()> {
+    verify_original(client, id, local).await?;
+    verify_review_tags_for(client, target, id, context).await
+}
+
+async fn verify_review_tags_for(
+    client: &PaperlessClient,
+    target: &PaperlessTarget,
+    id: i64,
+    context: &DeliveryContext,
 ) -> Result<()> {
     if !client.tag(target.inbox_tag_id).await?.is_inbox_tag {
         return Err(Error::InvalidResponse(
@@ -702,6 +881,12 @@ async fn verify_review_tags(
         || target
             .source_tag_id
             .is_some_and(|tag| !remote.tags.contains(&tag))
+        || context.config.as_ref().is_some_and(|config| {
+            config
+                .extra_tag_ids
+                .iter()
+                .any(|tag| !remote.tags.contains(tag))
+        })
     {
         return Err(Error::InvalidResponse(
             "Paperless document is missing its configured review tags",
@@ -710,34 +895,45 @@ async fn verify_review_tags(
     Ok(())
 }
 
-fn mark_verified(
+fn mark_verified_for(
     store: &mut Store,
     ledger: &mut Ledger,
     reference: &str,
     document_id: i64,
+    context: &DeliveryContext,
 ) -> Result<()> {
     ledger
         .entries
         .get_mut(reference)
         .ok_or(Error::Storage("Paperless delivery record is missing"))?
         .state = DeliveryState::Verified { document_id };
-    persist(store, LEDGER_NAME, ledger)
+    persist(store, &context.ledger_name, ledger)
 }
 
 fn load_ledger(store: &Store, target: &PaperlessTarget) -> Result<Ledger> {
-    let ledger = match store.read_private_state(LEDGER_NAME)? {
+    load_ledger_for(store, target, &DeliveryContext::legacy())
+}
+
+fn load_ledger_for(
+    store: &Store,
+    target: &PaperlessTarget,
+    context: &DeliveryContext,
+) -> Result<Ledger> {
+    let ledger = match store.read_private_state(&context.ledger_name)? {
         Some(raw) => serde_json::from_slice::<Ledger>(&raw)
             .map_err(|_| Error::Storage("Paperless delivery ledger is corrupt"))?,
         None => Ledger {
             schema_version: 1,
             namespace_hash: store.identity_hash().to_owned(),
             url: target.url.clone(),
+            destination_identity: context.destination_identity.clone(),
             entries: BTreeMap::new(),
         },
     };
     if ledger.schema_version != 1
         || ledger.namespace_hash != store.identity_hash()
         || ledger.url != target.url
+        || ledger.destination_identity != context.destination_identity
         || ledger.entries.len() > MAX_ITEMS
     {
         return Err(Error::Storage(
@@ -756,7 +952,7 @@ fn load_ledger(store: &Store, target: &PaperlessTarget) -> Result<Ledger> {
         if local.media_kind != "pdf"
             || local.sha256 != record.sha256
             || local.bytes != record.bytes
-            || record.filename != upload_filename(store, local)
+            || record.filename != upload_filename_for(store, local, context)
         {
             return Err(Error::Storage(
                 "Paperless delivery record conflicts with its local document",
@@ -822,6 +1018,23 @@ fn document_ref(store: &Store, letter_id: &str) -> String {
 }
 
 fn upload_filename(store: &Store, document: &SavedDocument) -> String {
+    upload_filename_for(store, document, &DeliveryContext::legacy())
+}
+
+fn upload_filename_for(
+    store: &Store,
+    document: &SavedDocument,
+    context: &DeliveryContext,
+) -> String {
+    if let Some(binding) = &context.destination_identity {
+        // Include destination identity without exceeding 255 filename bytes.
+        return format!(
+            "epost-{}-{}-{}.pdf",
+            binding,
+            document_ref(store, &document.letter_id),
+            document.sha256
+        );
+    }
     format!(
         "epost-{}-{}-{}.pdf",
         store.identity_hash(),
@@ -843,6 +1056,423 @@ fn valid_task_id(id: &str) -> bool {
                 byte.is_ascii_hexdigit()
             }
         })
+}
+
+fn upload_metadata(
+    store: &Store,
+    document: &SavedDocument,
+    target: &PaperlessTarget,
+    context: &DeliveryContext,
+) -> Result<UploadMetadata> {
+    let mut result = UploadMetadata {
+        tag_ids: std::iter::once(target.inbox_tag_id)
+            .chain(target.source_tag_id)
+            .collect(),
+        ..Default::default()
+    };
+    let Some(config) = &context.config else {
+        return Ok(result);
+    };
+    let source = store.source_metadata(&document.letter_id)?;
+    result.title = source.as_ref().and_then(|s| s.title.clone());
+    result.tag_ids.extend(&config.extra_tag_ids);
+    result.document_type = match &config.document_type {
+        DocumentTypePolicy::PaperlessAutomatic => None,
+        DocumentTypePolicy::Fixed(id) => Some(*id),
+        DocumentTypePolicy::Mapping(mapping) => {
+            let recognized: std::collections::BTreeSet<i64> = source
+                .as_ref()
+                .and_then(|s| s.document_types.as_ref())
+                .into_iter()
+                .flatten()
+                .filter_map(|source| mapping.get(source).copied())
+                .collect();
+            if recognized.len() == 1 {
+                recognized.into_iter().next()
+            } else {
+                None
+            }
+        }
+    };
+    for (id, value) in &config.custom_fields {
+        let value = match value {
+            MetadataValue::Literal(text) => Some(text.clone()),
+            MetadataValue::Source(SourceField::LetterId) => Some(document.letter_id.clone()),
+            MetadataValue::Source(SourceField::ReceivedAt) => {
+                source.as_ref().and_then(|s| s.received_at.clone())
+            }
+            MetadataValue::Source(SourceField::OriginalFileName) => {
+                source.as_ref().and_then(|s| s.original_file_name.clone())
+            }
+            MetadataValue::Source(SourceField::DocumentTypes) => source
+                .as_ref()
+                .and_then(|s| s.document_types.as_ref())
+                .filter(|types| !types.is_empty())
+                .map(|types| types.join(", ")),
+        };
+        if let Some(value) = value {
+            result
+                .custom_fields
+                .insert(*id, serde_json::Value::String(value));
+        }
+    }
+    Ok(result)
+}
+
+async fn validate_configured_metadata(
+    client: &PaperlessClient,
+    context: &DeliveryContext,
+) -> Result<()> {
+    let Some(config) = &context.config else {
+        return Ok(());
+    };
+    if !client.tag(config.target.inbox_tag_id).await?.is_inbox_tag {
+        return Err(Error::InvalidResponse(
+            "configured Paperless inbox tag is not an inbox tag",
+        ));
+    }
+    if let Some(id) = config.target.source_tag_id
+        && client.tag(id).await?.is_inbox_tag
+    {
+        return Err(Error::InvalidResponse(
+            "configured Paperless source tag must be a regular tag",
+        ));
+    }
+    for id in config
+        .extra_tag_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let _ = client.tag(id).await?;
+    }
+    for id in config.custom_fields.keys() {
+        if client.custom_field(*id).await?.data_type != "string" {
+            return Err(Error::Config(
+                "source metadata mappings require Paperless Text custom fields",
+            ));
+        }
+    }
+    let document_types: std::collections::BTreeSet<i64> = match &config.document_type {
+        DocumentTypePolicy::PaperlessAutomatic => Default::default(),
+        DocumentTypePolicy::Fixed(id) => [*id].into_iter().collect(),
+        DocumentTypePolicy::Mapping(mapping) => mapping.values().copied().collect(),
+    };
+    for id in document_types {
+        let _ = client.document_type(id).await?;
+    }
+    Ok(())
+}
+
+/// Check any retained history before saving a configuration, even after removal.
+pub fn validate_destination_ledger(store: &Store, destination: &Destination) -> Result<()> {
+    validate_destination(destination)?;
+    match &destination.kind {
+        DestinationKind::Paperless(config) => {
+            let context = DeliveryContext::named(store, destination, false)?;
+            let _ = load_ledger_for(store, &config.target, &context)?;
+        }
+        DestinationKind::Folder { .. } => {
+            let _ = load_folder_ledger(store, destination)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn destination_status(store: &Store, destination: &Destination) -> Result<DeliveryStatus> {
+    validate_destination_ledger(store, destination)?;
+    match &destination.kind {
+        DestinationKind::Paperless(config) => {
+            let context = DeliveryContext::named(store, destination, false)?;
+            let ledger = load_ledger_for(store, &config.target, &context)?;
+            let documents = store.saved_documents()?;
+            let mut result = DeliveryStatus {
+                saved_documents: documents.len(),
+                ..Default::default()
+            };
+            for document in documents {
+                if document.media_kind != "pdf" {
+                    result.unsupported += 1;
+                    continue;
+                }
+                match ledger
+                    .entries
+                    .get(&document_ref(store, &document.letter_id))
+                    .map(|r| &r.state)
+                {
+                    Some(DeliveryState::Uploading) => result.uncertain += 1,
+                    Some(DeliveryState::Pending { .. }) => result.pending += 1,
+                    Some(DeliveryState::TaskFailed { .. }) => result.task_failed += 1,
+                    Some(DeliveryState::Verified { .. }) => result.verified += 1,
+                    None => result.not_submitted += 1,
+                }
+            }
+            Ok(result)
+        }
+        DestinationKind::Folder { .. } => {
+            let ledger = load_folder_ledger(store, destination)?;
+            let documents = store.saved_documents()?;
+            let mut result = DeliveryStatus {
+                saved_documents: documents.len(),
+                ..Default::default()
+            };
+            for document in documents {
+                if document.media_kind != "pdf" {
+                    result.unsupported += 1;
+                } else if ledger
+                    .entries
+                    .contains_key(&document_ref(store, &document.letter_id))
+                {
+                    result.verified += 1;
+                } else {
+                    result.not_submitted += 1;
+                }
+            }
+            Ok(result)
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FolderLedger {
+    schema_version: u32,
+    namespace_hash: String,
+    destination_identity: String,
+    entries: BTreeMap<String, FolderRecord>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FolderRecord {
+    sha256: String,
+    bytes: u64,
+}
+
+fn load_folder_ledger(store: &Store, destination: &Destination) -> Result<FolderLedger> {
+    let identity = destination_identity(store, destination);
+    let ledger = match store.read_private_state(&ledger_name(destination))? {
+        None => FolderLedger {
+            schema_version: 1,
+            namespace_hash: store.identity_hash().into(),
+            destination_identity: identity.clone(),
+            entries: BTreeMap::new(),
+        },
+        Some(raw) => serde_json::from_slice::<FolderLedger>(&raw)
+            .map_err(|_| Error::Storage("folder delivery ledger is corrupt"))?,
+    };
+    if ledger.schema_version != 1
+        || ledger.namespace_hash != store.identity_hash()
+        || ledger.destination_identity != identity
+        || ledger.entries.len() > MAX_ITEMS
+    {
+        return Err(Error::Storage(
+            "folder ledger namespace, destination or version is invalid",
+        ));
+    }
+    let inventory: BTreeMap<String, SavedDocument> = store
+        .saved_documents()?
+        .into_iter()
+        .map(|d| (document_ref(store, &d.letter_id), d))
+        .collect();
+    for (reference, record) in &ledger.entries {
+        let local = inventory.get(reference).ok_or(Error::Storage(
+            "folder ledger refers to unknown local document",
+        ))?;
+        if local.media_kind != "pdf" || local.sha256 != record.sha256 || local.bytes != record.bytes
+        {
+            return Err(Error::Storage(
+                "folder ledger conflicts with local document",
+            ));
+        }
+    }
+    Ok(ledger)
+}
+
+pub async fn deliver_folder(
+    store: &mut Store,
+    destination: &Destination,
+    options: DeliveryOptions,
+    progress: impl FnMut(DeliveryEvent),
+) -> Result<DeliveryReport> {
+    folder_inner(store, destination, options, false, progress).await
+}
+
+/// Verify existing copies; never copy an unsubmitted PDF during this audit.
+pub async fn verify_folder(
+    store: &mut Store,
+    destination: &Destination,
+    options: DeliveryOptions,
+    progress: impl FnMut(DeliveryEvent),
+) -> Result<DeliveryReport> {
+    folder_inner(store, destination, options, true, progress).await
+}
+
+async fn folder_inner(
+    store: &mut Store,
+    destination: &Destination,
+    options: DeliveryOptions,
+    verify_only: bool,
+    mut progress: impl FnMut(DeliveryEvent),
+) -> Result<DeliveryReport> {
+    validate_destination(destination)?;
+    let DestinationKind::Folder { path } = &destination.kind else {
+        return Err(Error::Config("destination is not a folder"));
+    };
+    if path == store.root_path() {
+        return Err(Error::Config("folder destination is the source store"));
+    }
+    if options.max_documents == 0 || options.max_documents > MAX_ITEMS {
+        return Err(Error::Config("folder delivery bounds are invalid"));
+    }
+    let mut ledger = load_folder_ledger(store, destination)?;
+    let mut output = if verify_only && (ledger.entries.is_empty() || !path.exists()) {
+        None
+    } else {
+        Some(Store::open(
+            path,
+            &format!(
+                "epost-folder-v1:{}:{}",
+                store.identity_hash(),
+                destination_identity(store, destination)
+            ),
+        )?)
+    };
+    if output
+        .as_ref()
+        .is_some_and(|output| output.root_path() == store.root_path())
+    {
+        return Err(Error::Config("folder destination is the source store"));
+    }
+    let documents = store.saved_documents()?;
+    if documents.len() > MAX_ITEMS {
+        return Err(Error::Storage("folder inventory exceeds item bound"));
+    }
+    let mut report = DeliveryReport::default();
+    let mut work = 0;
+    progress(report.event(DeliveryPhase::Started, documents.len()));
+    for document in &documents {
+        let reference = document_ref(store, &document.letter_id);
+        if crate::progress::stop_requested() {
+            report.cancelled = true;
+            report.add(item(
+                &reference,
+                DeliveryItemStatus::NotAttempted,
+                None,
+                Some("delivery stopped at a safe boundary; run again to continue"),
+            ));
+            continue;
+        }
+        if document.media_kind != "pdf" {
+            report.add(item(
+                &reference,
+                DeliveryItemStatus::Unsupported,
+                None,
+                Some("only validated PDF files are supported for folder delivery"),
+            ));
+            continue;
+        }
+        if verify_only && !ledger.entries.contains_key(&reference) {
+            report.add(item(
+                &reference,
+                DeliveryItemStatus::NotAttempted,
+                None,
+                Some("this PDF has not been copied to the destination; run check to deliver it"),
+            ));
+            continue;
+        }
+        if !ledger.entries.contains_key(&reference) {
+            if work >= options.max_documents {
+                report.add(item(
+                    &reference,
+                    DeliveryItemStatus::DeferredLimit,
+                    None,
+                    Some("delivery limit reached; run again to continue"),
+                ));
+                continue;
+            }
+            work += 1;
+        }
+        let bytes = match store.read_saved(&document.letter_id) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                report.add(item_error(
+                    &reference,
+                    DeliveryItemStatus::Failed,
+                    None,
+                    &error,
+                ));
+                continue;
+            }
+        };
+        progress(report.event(DeliveryPhase::Uploading, documents.len()));
+        if verify_only {
+            let copied = output
+                .as_ref()
+                .ok_or(Error::Storage("folder destination is missing"))
+                .and_then(|output| output.read_saved(&document.letter_id));
+            match copied {
+                Ok(copy) if copy == bytes => report.add(item(
+                    &reference,
+                    DeliveryItemStatus::AlreadyDelivered,
+                    None,
+                    None,
+                )),
+                Ok(_) => report.add(item(
+                    &reference,
+                    DeliveryItemStatus::Failed,
+                    None,
+                    Some("folder copy does not match the local PDF"),
+                )),
+                Err(error) => report.add(item_error(
+                    &reference,
+                    DeliveryItemStatus::Failed,
+                    None,
+                    &error,
+                )),
+            }
+            continue;
+        }
+        match output
+            .as_mut()
+            .ok_or(Error::Storage("folder destination is missing"))?
+            .save(
+                &document.letter_id,
+                "epost",
+                &bytes,
+                Some("application/pdf"),
+            ) {
+            Ok(saved) => {
+                let repeated = ledger.entries.contains_key(&reference);
+                ledger.entries.insert(
+                    reference.clone(),
+                    FolderRecord {
+                        sha256: saved.sha256,
+                        bytes: saved.bytes,
+                    },
+                );
+                persist(store, &ledger_name(destination), &ledger)?;
+                report.add(item(
+                    &reference,
+                    if repeated {
+                        DeliveryItemStatus::AlreadyDelivered
+                    } else {
+                        DeliveryItemStatus::Delivered
+                    },
+                    None,
+                    None,
+                ));
+            }
+            Err(error) => report.add(item_error(
+                &reference,
+                DeliveryItemStatus::Failed,
+                None,
+                &error,
+            )),
+        }
+    }
+    progress(report.event(DeliveryPhase::Finished, documents.len()));
+    Ok(report)
 }
 
 fn item(

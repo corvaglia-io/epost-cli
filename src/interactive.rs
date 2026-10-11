@@ -436,12 +436,40 @@ pub(crate) async fn run(cli: &Cli, prompts: &mut impl Prompts) -> Result<u8> {
         Command::Browse {
             output: explicit,
             page_size,
+            location,
         } => {
             drop(secret);
             let Some(output) = destination(cli, explicit.as_deref(), prompts)? else {
                 return Ok(0);
             };
             let mut exit = 0;
+            if let Some(location) = location {
+                let source = match location {
+                    modern::Location::Inbox => Source::Inbox,
+                    modern::Location::Archive => {
+                        match archive_source(&mut client, prompts).await? {
+                            Some(source) => source,
+                            None => return Ok(0),
+                        }
+                    }
+                    modern::Location::All => {
+                        return Err(Error::Config(
+                            "browse supports inbox or archive; use check all for combined retrieval",
+                        ));
+                    }
+                };
+                return Ok(browse_page(
+                    cli,
+                    &mut client,
+                    &mailbox,
+                    source,
+                    &output,
+                    *page_size,
+                    prompts,
+                )
+                .await?
+                .0);
+            }
             loop {
                 prompts.line("\n1 = inbox, 2 = archive, 3 = sync new documents, q = quit")?;
                 let Some(answer) = cancelled(prompts.input("Action: ")?) else {
@@ -511,6 +539,7 @@ pub(crate) async fn run(cli: &Cli, prompts: &mut impl Prompts) -> Result<u8> {
                                 output: output.clone(),
                                 page_size: 48,
                                 max_pages: 1000,
+                                max_documents: 100_000,
                             },
                         )
                         .await?;
@@ -540,7 +569,7 @@ fn remember_login(
 fn login_message(profile: &Profile, prompts: &mut impl Prompts) -> Result<()> {
     match profile.login.as_ref().map(|login| login.method) {
         Some(LoginMethod::MacosKeychain) => prompts.line("Account email remembered; future commands obtain the password from macOS Keychain. No authenticated session is saved."),
-        _ => prompts.line("Account email remembered; future commands still need a password. Use profile login --remember for macOS Keychain, or your scheduler's secret mechanism."),
+        _ => prompts.line("Account email remembered; future commands still need a password. Use epost login --remember for macOS Keychain, or your scheduler's secret mechanism."),
     }
 }
 

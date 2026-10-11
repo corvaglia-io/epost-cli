@@ -17,9 +17,10 @@ must distinguish stored documents from reviewed/handled documents; delivery does
 not mean an invoice was paid or a deadline was handled. Prefer a separate command
 with a preview and explicit policy rather than changing normal sync behavior.
 
-Other Paperless candidates are document metadata mapping, migration between
-instances, controlled resubmission of terminal failed uploads, and optional
-Cloudflare Access service-token authentication. None is implemented today.
+Named destinations and selected optional metadata mappings are implemented.
+Remaining candidates are migration of documents between instances, controlled
+resubmission of terminal failed uploads, and optional Cloudflare Access
+service-token authentication. These remain unimplemented.
 
 ## Authenticated website download fallback
 

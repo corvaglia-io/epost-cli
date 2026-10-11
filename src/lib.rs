@@ -5,6 +5,7 @@ pub mod api;
 pub mod config;
 pub mod credentials;
 pub mod delivery;
+pub mod destinations;
 pub mod error;
 pub mod keychain;
 pub mod models;

@@ -19,6 +19,11 @@ pub fn is_missing(error: &Error) -> bool {
 /// A small boundary for injecting synthetic credential stores in tests.
 pub trait CredentialStore {
     fn get(&self, service: &str, account: &str) -> Result<Secret>;
+    /// Read without displaying OS authentication UI. Synthetic stores may use
+    /// their ordinary read; native backends must suppress interaction explicitly.
+    fn get_noninteractive(&self, service: &str, account: &str) -> Result<Secret> {
+        self.get(service, account)
+    }
     fn get_optional(&self, service: &str, account: &str) -> Result<Option<Secret>> {
         match self.get(service, account) {
             Ok(secret) => Ok(Some(secret)),
@@ -39,18 +44,55 @@ pub const fn supported() -> bool {
     cfg!(target_os = "macos")
 }
 
+// The crate's macOS interaction guard changes process-wide Keychain UI state.
+// Serialize our native calls so a guarded read cannot overlap another native
+// operation. No asynchronous suspension occurs while this lock is held.
+#[cfg(target_os = "macos")]
+static NATIVE_ACCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(target_os = "macos")]
+fn native_access() -> Result<std::sync::MutexGuard<'static, ()>> {
+    NATIVE_ACCESS.lock().map_err(|_| {
+        Error::Config("Keychain access is unavailable; retry or supply runtime credentials")
+    })
+}
+
 #[cfg(target_os = "macos")]
 impl CredentialStore for NativeStore {
     fn get(&self, service: &str, account: &str) -> Result<Secret> {
         let options = native_options(service, account)?;
+        let _access = native_access()?;
         let bytes = security_framework::passwords::generic_password(options)
             .map_err(|error| status_error(error.code()))?;
+        secret_from_bytes(bytes)
+    }
+
+    fn get_noninteractive(&self, service: &str, account: &str) -> Result<Secret> {
+        use security_framework::os::macos::keychain::SecKeychain;
+
+        let options = native_options(service, account)?;
+        let _access = native_access()?;
+        // PasswordOptions in security-framework 3.7 has no authentication-UI
+        // setter. Use its supported macOS guard around this synchronous read.
+        // The guard reenables interaction on drop, so preserve an already
+        // disabled state by creating it only when interaction was allowed.
+        let interaction_allowed = SecKeychain::user_interaction_allowed()
+            .map_err(|_| Error::Config("Keychain authentication UI could not be disabled; supply runtime credentials for this non-interactive run"))?;
+        let _interaction = if interaction_allowed {
+            Some(SecKeychain::disable_user_interaction()
+                .map_err(|_| Error::Config("Keychain authentication UI could not be disabled; supply runtime credentials for this non-interactive run"))?)
+        } else {
+            None
+        };
+        let bytes = security_framework::passwords::generic_password(options)
+            .map_err(|error| noninteractive_status_error(error.code()))?;
         secret_from_bytes(bytes)
     }
 
     fn set(&self, service: &str, account: &str, password: &Secret) -> Result<()> {
         let options = native_options(service, account)?;
         validate_password(password.expose())?;
+        let _access = native_access()?;
         security_framework::passwords::set_generic_password_options(
             password.expose().as_bytes(),
             options,
@@ -60,6 +102,7 @@ impl CredentialStore for NativeStore {
 
     fn delete(&self, service: &str, account: &str) -> Result<()> {
         let options = native_options(service, account)?;
+        let _access = native_access()?;
         match security_framework::passwords::delete_generic_password_options(options) {
             Ok(()) => Ok(()),
             Err(error) if error.code() == ITEM_NOT_FOUND => Ok(()),
@@ -162,6 +205,16 @@ fn status_error(code: i32) -> Error {
     Error::Config(message)
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn noninteractive_status_error(code: i32) -> Error {
+    match code {
+        -25308 | -25293 | -34018 | -128 => Error::Config(
+            "saved Keychain sign-in requires interactive authorization; unlock the login Keychain and authorize epost-cli in an interactive session, or supply runtime credentials for this non-interactive run",
+        ),
+        _ => status_error(code),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +257,13 @@ mod tests {
         assert_eq!(
             store
                 .get("synthetic-service-a", "user@example.invalid")
+                .unwrap()
+                .expose(),
+            password.expose()
+        );
+        assert_eq!(
+            store
+                .get_noninteractive("synthetic-service-a", "user@example.invalid")
                 .unwrap()
                 .expose(),
             password.expose()
@@ -268,6 +328,27 @@ mod tests {
             assert_eq!(error.exit_code(), 1);
             assert_eq!(is_missing(&error), code == ITEM_NOT_FOUND);
         }
+    }
+
+    #[test]
+    fn noninteractive_status_errors_never_suggest_prompting_during_the_run() {
+        for code in [-25308, -25293, -34018, -128] {
+            let error = noninteractive_status_error(code);
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires interactive authorization")
+            );
+            assert!(error.to_string().contains("supply runtime credentials"));
+            assert!(!error.to_string().contains(&code.to_string()));
+            assert!(!is_missing(&error));
+        }
+        assert!(is_missing(&noninteractive_status_error(ITEM_NOT_FOUND)));
+        assert!(
+            noninteractive_status_error(-25291)
+                .to_string()
+                .contains("unavailable")
+        );
     }
 
     #[test]

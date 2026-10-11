@@ -90,9 +90,10 @@ trap 'exit 143' TERM
 
 mkdir "$temporary/$name"
 cp "$binary" "$temporary/$name/epost-cli"
+cp "$binary" "$temporary/$name/epost"
 cp "$repository/LICENSE" "$temporary/$name/LICENSE"
 cp "$repository/README.md" "$temporary/$name/README.md"
-chmod 0755 "$temporary/$name" "$temporary/$name/epost-cli"
+chmod 0755 "$temporary/$name" "$temporary/$name/epost-cli" "$temporary/$name/epost"
 chmod 0644 "$temporary/$name/LICENSE" "$temporary/$name/README.md"
 # macOS tar otherwise may add AppleDouble entries for copied extended attributes.
 COPYFILE_DISABLE=1 tar -czf "$temporary/$name.tar.gz" -C "$temporary" "$name"

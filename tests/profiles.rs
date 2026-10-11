@@ -93,7 +93,8 @@ fn roundtrip_preserves_other_profiles_and_only_declared_settings() {
     assert!(config::load_profile(&fixture.config, "absent").is_err());
     let document = fixture.document();
     assert_eq!(document["schema_version"], 1);
-    assert_eq!(document.as_object().unwrap().len(), 2);
+    assert_eq!(document.as_object().unwrap().len(), 3);
+    assert_eq!(document["default_profile"], "personal");
     assert_eq!(document["profiles"].as_object().unwrap().len(), 2);
     for profile in document["profiles"].as_object().unwrap().values() {
         let keys: Vec<_> = profile
@@ -112,6 +113,9 @@ fn schema_one_profiles_without_login_load_unchanged() {
     let fixture = Fixture::new();
     let expected = fixture.profile();
     config::save_profile(&fixture.config, "personal", &expected).unwrap();
+    fixture.modify(|document| {
+        document.as_object_mut().unwrap().remove("default_profile");
+    });
     let raw = fs::read(&fixture.config).unwrap();
     let document = fixture.document();
     assert_eq!(document["schema_version"], 1);

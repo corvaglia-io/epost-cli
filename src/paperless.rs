@@ -4,7 +4,7 @@
 //! response may still have queued a document or created a tag. The caller must
 //! reconcile its durable delivery state before attempting another upload.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
 
@@ -64,6 +64,29 @@ pub struct Task {
 pub struct Document {
     pub id: i64,
     pub tags: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DocumentType {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CustomField {
+    pub id: i64,
+    pub name: String,
+    pub data_type: String,
+}
+
+/// Optional upload metadata. Receipt time belongs in a Text custom field;
+/// this type intentionally has no document issue/creation date override.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UploadMetadata {
+    pub title: Option<String>,
+    pub tag_ids: Vec<i64>,
+    pub document_type: Option<i64>,
+    pub custom_fields: BTreeMap<i64, Value>,
 }
 
 // Do not derive Debug: reqwest's client stores authentication headers.
@@ -230,15 +253,165 @@ impl PaperlessClient {
         Ok(tag)
     }
 
+    pub async fn document_types(&self) -> Result<Vec<DocumentType>> {
+        let entries = self.list("api/document_types/", &[]).await?;
+        let mut seen = BTreeSet::new();
+        entries
+            .into_iter()
+            .map(|entry| {
+                let item = parse_document_type(entry)?;
+                if !seen.insert(item.id) {
+                    return Err(Error::InvalidResponse(
+                        "duplicate Paperless document type ID",
+                    ));
+                }
+                Ok(item)
+            })
+            .collect()
+    }
+
+    pub async fn document_type(&self, id: i64) -> Result<DocumentType> {
+        validate_document_id(id)?;
+        let response = self.get(&format!("api/document_types/{id}/"), &[]).await?;
+        let item = parse_document_type(self.json(response).await?)?;
+        if item.id != id {
+            return Err(Error::InvalidResponse(
+                "Paperless document type ID does not match",
+            ));
+        }
+        Ok(item)
+    }
+
+    pub async fn create_document_type(&self, name: &str) -> Result<DocumentType> {
+        validate_tag_name(name)
+            .map_err(|_| Error::Config("invalid Paperless document type name"))?;
+        let response = self
+            .post(
+                self.http
+                    .post(self.endpoint("api/document_types/")?)
+                    .json(&serde_json::json!({"name":name})),
+            )
+            .await?;
+        let item = parse_document_type(self.json(response).await?)?;
+        if item.name != name {
+            return Err(Error::InvalidResponse(
+                "created Paperless document type does not match request",
+            ));
+        }
+        Ok(item)
+    }
+
+    pub async fn custom_fields(&self) -> Result<Vec<CustomField>> {
+        let entries = self.list("api/custom_fields/", &[]).await?;
+        let mut seen = BTreeSet::new();
+        entries
+            .into_iter()
+            .map(|entry| {
+                let item = parse_custom_field(entry)?;
+                if !seen.insert(item.id) {
+                    return Err(Error::InvalidResponse(
+                        "duplicate Paperless custom field ID",
+                    ));
+                }
+                Ok(item)
+            })
+            .collect()
+    }
+
+    pub async fn custom_field(&self, id: i64) -> Result<CustomField> {
+        validate_document_id(id)?;
+        let response = self.get(&format!("api/custom_fields/{id}/"), &[]).await?;
+        let item = parse_custom_field(self.json(response).await?)?;
+        if item.id != id {
+            return Err(Error::InvalidResponse(
+                "Paperless custom field ID does not match",
+            ));
+        }
+        Ok(item)
+    }
+
+    /// Create the Text datatype used by source provenance mappings.
+    pub async fn create_custom_field(&self, name: &str) -> Result<CustomField> {
+        validate_tag_name(name)
+            .map_err(|_| Error::Config("invalid Paperless custom field name"))?;
+        let response = self
+            .post(
+                self.http
+                    .post(self.endpoint("api/custom_fields/")?)
+                    .json(&serde_json::json!({"name":name,"data_type":"string"})),
+            )
+            .await?;
+        let item = parse_custom_field(self.json(response).await?)?;
+        if item.name != name || item.data_type != "string" {
+            return Err(Error::InvalidResponse(
+                "created Paperless custom field does not match request",
+            ));
+        }
+        Ok(item)
+    }
+
     pub async fn upload_pdf(&self, filename: &str, bytes: Vec<u8>, tags: &[i64]) -> Result<String> {
-        self.validate_upload(filename, &bytes, tags)?;
+        self.upload_pdf_with_metadata(
+            filename,
+            bytes,
+            &UploadMetadata {
+                tag_ids: tags.to_vec(),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    pub fn validate_upload_metadata(
+        &self,
+        filename: &str,
+        bytes: &[u8],
+        metadata: &UploadMetadata,
+    ) -> Result<()> {
+        self.validate_upload(filename, bytes, &metadata.tag_ids)?;
+        if metadata.document_type.is_some_and(|id| id <= 0) || metadata.custom_fields.len() > 64 {
+            return Err(Error::Config("invalid Paperless upload metadata"));
+        }
+        if let Some(title) = &metadata.title {
+            validate_upload_text(title, 4096)?;
+        }
+        for (id, value) in &metadata.custom_fields {
+            if *id <= 0 {
+                return Err(Error::Config("invalid Paperless custom field ID"));
+            }
+            let text = value.as_str().ok_or(Error::Config(
+                "Paperless provenance custom fields must contain Text values",
+            ))?;
+            validate_upload_text(text, 4096)?;
+        }
+        Ok(())
+    }
+
+    pub async fn upload_pdf_with_metadata(
+        &self,
+        filename: &str,
+        bytes: Vec<u8>,
+        metadata: &UploadMetadata,
+    ) -> Result<String> {
+        self.validate_upload_metadata(filename, &bytes, metadata)?;
         let part = reqwest::multipart::Part::bytes(bytes)
             .file_name(filename.to_owned())
             .mime_str("application/pdf")
             .map_err(|_| Error::Config("invalid Paperless upload media type"))?;
         let mut form = reqwest::multipart::Form::new().part("document", part);
-        for tag in tags.iter().copied().collect::<BTreeSet<_>>() {
+        for tag in metadata.tag_ids.iter().copied().collect::<BTreeSet<_>>() {
             form = form.text("tags", tag.to_string());
+        }
+        if let Some(title) = &metadata.title {
+            form = form.text("title", title.clone());
+        }
+        if let Some(id) = metadata.document_type {
+            form = form.text("document_type", id.to_string());
+        }
+        if !metadata.custom_fields.is_empty() {
+            let fields = serde_json::to_string(&metadata.custom_fields)
+                .map_err(|_| Error::Config("invalid Paperless custom field values"))?;
+            form = form.text("custom_fields", fields);
         }
         let request = self
             .http
@@ -586,6 +759,42 @@ impl PaperlessClient {
         serde_json::from_slice(&self.bytes(response).await?)
             .map_err(|_| Error::InvalidResponse("invalid Paperless JSON response"))
     }
+}
+
+fn validate_upload_text(text: &str, max: usize) -> Result<()> {
+    if text.trim().is_empty() || text.len() > max || text.chars().any(char::is_control) {
+        return Err(Error::Config("invalid Paperless metadata text"));
+    }
+    Ok(())
+}
+
+fn parse_document_type(value: Value) -> Result<DocumentType> {
+    let item: DocumentType = serde_json::from_value(value)
+        .map_err(|_| Error::InvalidResponse("invalid Paperless document type"))?;
+    if item.id <= 0 {
+        return Err(Error::InvalidResponse("invalid Paperless document type ID"));
+    }
+    validate_tag_name(&item.name)?;
+    Ok(item)
+}
+
+fn parse_custom_field(value: Value) -> Result<CustomField> {
+    let item: CustomField = serde_json::from_value(value)
+        .map_err(|_| Error::InvalidResponse("invalid Paperless custom field"))?;
+    if item.id <= 0
+        || item.data_type.is_empty()
+        || item.data_type.len() > 32
+        || !item
+            .data_type
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+    {
+        return Err(Error::InvalidResponse(
+            "invalid Paperless custom field ID or datatype",
+        ));
+    }
+    validate_tag_name(&item.name)?;
+    Ok(item)
 }
 
 fn validate_document_id(id: i64) -> Result<()> {

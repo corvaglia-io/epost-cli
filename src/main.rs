@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use epost_cli::{
     api::{ApiClient, ClientOptions, Environment},
     config::{self, Login, LoginMethod, Profile, SyncScope as Scope},
@@ -13,10 +13,14 @@ use epost_cli::{
     summary::{attention_lines, sync_summary},
 };
 
+mod destination_cli;
+mod doctor;
 mod interactive;
 #[cfg(test)]
 mod interactive_tests;
+mod modern;
 mod paperless_cli;
+mod tui;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -24,12 +28,23 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(
     version,
     about = "Unofficial read-only ePost inbox and archive retrieval"
 )]
 struct Cli {
+    /// Never prompt for input or native credential approval.
+    #[arg(long, global = true)]
+    non_interactive: bool,
+    #[arg(skip)]
+    prepared_credentials: Option<(String, Secret)>,
+    #[arg(skip)]
+    prepared_paperless_token: Option<Secret>,
+    #[arg(skip)]
+    prepared_destination_tokens: std::collections::BTreeMap<String, Secret>,
+    #[arg(skip)]
+    prepared_destination_failures: std::collections::BTreeSet<String>,
     /// Compact, structured JSON on stdout; diagnostics stay on stderr.
     #[arg(long, global = true)]
     json: bool,
@@ -75,8 +90,30 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Command {
+    /// Open the interactive terminal application (also the default without a command).
+    Menu,
+    /// Fetch documents and deliver to all configured destinations.
+    Check(modern::ScopeArgs),
+    /// Inspect metadata and local delivery state without fetching documents.
+    Status(modern::StatusArgs),
+    /// Resume saved-document delivery to all configured destinations.
+    Deliver(modern::DeliveryArgs),
+    /// Audit local files and destination copies.
+    Verify(modern::DeliveryArgs),
+    /// Diagnose credentials, local storage, DNS/TLS and destination access.
+    Doctor(doctor::DoctorArgs),
+    /// Configure named delivery destinations; all are used by default.
+    Destination {
+        #[command(subcommand)]
+        command: destination_cli::DestinationCommand,
+    },
+    /// List profiles or choose the default account.
+    Profile {
+        #[command(subcommand)]
+        command: modern::ProfileCommand,
+    },
     /// Guided mailbox setup; remember the username and optionally use macOS Keychain.
     Setup {
         #[arg(long)]
@@ -86,6 +123,8 @@ enum Command {
     },
     /// Sign in once, browse readable inbox/archive pages, and download by number.
     Browse {
+        #[arg(value_enum)]
+        location: Option<modern::Location>,
         #[arg(long)]
         output: Option<PathBuf>,
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=1000))]
@@ -128,14 +167,14 @@ enum Command {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum InboxCommand {
     List(ListArgs),
     /// Check unread or unsaved inbox items without downloading content.
     Check(CheckArgs),
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 struct CheckArgs {
     /// One unread-count request; does not check locally unsaved documents.
     #[arg(long)]
@@ -152,7 +191,7 @@ struct CheckArgs {
     max_pages: u32,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum ArchiveCommand {
     Folders,
     List {
@@ -165,7 +204,7 @@ enum ArchiveCommand {
     },
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 struct ListArgs {
     #[arg(long, default_value_t = 48, value_parser = clap::value_parser!(u32).range(1..=1000))]
     page_size: u32,
@@ -178,7 +217,7 @@ struct ListArgs {
     max_pages: u32,
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 struct SyncArgs {
     /// Deliver saved PDFs to the explicitly configured Paperless destination after sync.
     #[arg(long)]
@@ -198,6 +237,7 @@ struct ResolvedSyncArgs {
     output: PathBuf,
     page_size: u32,
     max_pages: u32,
+    max_documents: usize,
 }
 
 fn environment(cli: &Cli) -> Environment {
@@ -220,6 +260,17 @@ fn output(cli: &Cli, explicit: Option<&Path>) -> Result<PathBuf> {
 fn load_profile(cli: &mut Cli) -> Result<()> {
     if matches!(cli.command, Command::Setup { .. }) {
         return Ok(());
+    }
+    if cli.profile.is_none()
+        && !matches!(
+            cli.command,
+            Command::Tenants | Command::Profile { .. } | Command::Doctor(_)
+        )
+        && cli.tenant_kind.is_none()
+        && cli.tenant_id.is_none()
+        && cli.company_id.is_none()
+    {
+        cli.profile = config::default_profile(&config::path(cli.config.as_deref())?)?;
     }
     if let Some(name) = &cli.profile {
         if cli.tenant_kind.is_some()
@@ -297,6 +348,28 @@ fn env_secret(name: &str) -> Result<Option<Secret>> {
 }
 
 fn password(cli: &Cli) -> Result<(String, Secret)> {
+    password_with_prompt(cli, |secret| {
+        if secret {
+            Ok(Some(rpassword::prompt_password(
+                "ePost/KLARA password (not SwissID): ",
+            )?))
+        } else {
+            eprint!("ePost account email: ");
+            io::stderr().flush()?;
+            let mut value = String::new();
+            io::stdin().read_line(&mut value)?;
+            Ok(Some(value.trim().to_owned()))
+        }
+    })
+}
+
+fn password_with_prompt(
+    cli: &Cli,
+    mut prompt: impl FnMut(bool) -> Result<Option<String>>,
+) -> Result<(String, Secret)> {
+    if let Some(credentials) = &cli.prepared_credentials {
+        return Ok(credentials.clone());
+    }
     let username = match std::env::var("EPOST_USERNAME") {
         Ok(value) => value,
         Err(std::env::VarError::NotUnicode(_)) => {
@@ -318,12 +391,8 @@ fn password(cli: &Cli) -> Result<(String, Secret)> {
                 .username
                 .clone()
         }
-        Err(_) if io::stdin().is_terminal() => {
-            eprint!("ePost account email: ");
-            io::stderr().flush()?;
-            let mut value = String::new();
-            io::stdin().read_line(&mut value)?;
-            value.trim().to_owned()
+        Err(_) if io::stdin().is_terminal() && !cli.non_interactive => {
+            prompt(false)?.ok_or(Error::Config("credential entry cancelled"))?
         }
         _ => {
             return Err(Error::Config(
@@ -338,7 +407,7 @@ fn password(cli: &Cli) -> Result<(String, Secret)> {
         ));
     }
     let secret = if cli.password_stdin {
-        let mut input = String::new();
+        let mut input = zeroize::Zeroizing::new(String::new());
         io::stdin().lock().take(8193).read_to_string(&mut input)?;
         if input.len() > 8192 {
             return Err(Error::Config("password input is too long"));
@@ -366,7 +435,12 @@ fn password(cli: &Cli) -> Result<(String, Secret)> {
                 "runtime username differs from saved sign-in; supply a password or run profile login again",
             ));
         }
-        credentials::get(
+        let retrieve = if cli.non_interactive {
+            credentials::get_noninteractive
+        } else {
+            credentials::get
+        };
+        retrieve(
             &keychain::NativeStore,
             &config::path(cli.config.as_deref())?,
             cli.profile.as_deref().unwrap(),
@@ -374,11 +448,10 @@ fn password(cli: &Cli) -> Result<(String, Secret)> {
             profile,
             &username,
         )?
-    } else if io::stdin().is_terminal() {
+    } else if io::stdin().is_terminal() && !cli.non_interactive {
         loop {
-            let candidate = Secret::new(rpassword::prompt_password(
-                "ePost/KLARA password (not SwissID): ",
-            )?);
+            let candidate =
+                Secret::new(prompt(true)?.ok_or(Error::Config("credential entry cancelled"))?);
             if !candidate.expose().is_empty() && candidate.expose().len() <= 8192 {
                 break candidate;
             }
@@ -409,6 +482,15 @@ fn native_keychain_allowed(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+fn native_keychain_mutation_allowed(cli: &Cli) -> Result<()> {
+    if cli.non_interactive {
+        return Err(Error::Config(
+            "changing saved Keychain credentials requires interactive mode; omit --non-interactive",
+        ));
+    }
+    native_keychain_allowed(cli)
+}
+
 fn uses_keychain(profile: &Profile) -> bool {
     profile
         .login
@@ -434,7 +516,7 @@ fn persist_profile(
         return config::save_profile_if_unchanged(&path, name, profile, previous);
     }
     if uses_keychain(profile) || previous.is_some_and(uses_keychain) {
-        native_keychain_allowed(cli)?;
+        native_keychain_mutation_allowed(cli)?;
         credentials::save_profile_login(
             &keychain::NativeStore,
             &path,
@@ -449,7 +531,7 @@ fn persist_profile(
 }
 
 fn progress_enabled(cli: &Cli) -> bool {
-    !cli.no_progress && (cli.progress || (!cli.json && io::stderr().is_terminal()))
+    !cli.no_progress && (cli.progress || !cli.json)
 }
 
 fn mailbox(cli: &Cli) -> Result<Mailbox> {
@@ -603,6 +685,7 @@ async fn retrieve(
         .filter(|id| !id.is_empty())
         .ok_or(Error::InvalidResponse("letter has no usable ID"))?;
     let existing = store.verify_existing(id, source)?;
+    store.record_metadata(letter)?;
     if registered_pending(letter) {
         return Ok(Retrieval {
             letter_id: Some(id.into()),
@@ -632,6 +715,7 @@ async fn retrieve(
             let mut status = "failed";
             match client.letter(id).await {
                 Ok(current) if current.id.as_deref() == Some(id) => {
+                    store.record_metadata(&current)?;
                     diagnostic = content_diagnostic(&current);
                     diagnostic.metadata_http_status = Some(200);
                     if registered_pending(&current) {
@@ -804,7 +888,14 @@ async fn sync_with_progress(
         }
     }
     let mut exit = 0;
+    let mut attempts = 0;
     for source in sources {
+        if epost_cli::progress::stop_requested() {
+            report
+                .issues
+                .push("stopped before remaining sources".into());
+            return Ok((value(report)?, exit.max(2)));
+        }
         reporter.event(Event::InventoryStarted {
             label: match source {
                 Source::Inbox => "inbox",
@@ -877,6 +968,12 @@ async fn sync_with_progress(
             return Ok((value(report)?, exit.max(3)));
         }
         for (index, letter) in inventory.letters.iter().enumerate() {
+            if epost_cli::progress::stop_requested() {
+                report
+                    .issues
+                    .push("stopped before remaining documents".into());
+                return Ok((value(report)?, exit.max(2)));
+            }
             if report.documents.len() >= 100_000 {
                 report.pagination_complete = false;
                 report
@@ -884,6 +981,26 @@ async fn sync_with_progress(
                     .push("sync document safety limit reached; remaining letters deferred".into());
                 return Ok((value(report)?, exit.max(2)));
             }
+            let already = match letter.id.as_deref() {
+                Some(id) => store.contains_saved(id)?,
+                None => false,
+            };
+            if !already && !registered_pending(letter) && attempts >= args.max_documents {
+                report.documents.push(Retrieval {
+                    letter_id: letter.id.clone(),
+                    source: source.label(),
+                    status: "deferred_limit".into(),
+                    document: None,
+                    error: None,
+                    diagnostic: None,
+                });
+                exit = exit.max(2);
+                continue;
+            }
+            if !already && !registered_pending(letter) {
+                attempts += 1;
+            }
+
             reporter.event(Event::DocumentStarted {
                 index: index + 1,
                 total: inventory.letters.len(),
@@ -1032,6 +1149,7 @@ async fn check_inbox(
                 output: destination,
                 page_size: args.page_size,
                 max_pages: args.max_pages,
+                max_documents: 100_000,
             },
             &mut reporter,
         )
@@ -1122,6 +1240,17 @@ fn check_summary(report: &Value, code: u8) -> Vec<String> {
 }
 
 async fn run(cli: &Cli) -> Result<(Value, u8)> {
+    match &cli.command {
+        Command::Check(_)
+        | Command::Status(_)
+        | Command::Deliver(_)
+        | Command::Verify(_)
+        | Command::Profile { .. } => return modern::run(cli).await,
+        Command::Destination { command } => return destination_cli::run(cli, command).await,
+        Command::Doctor(args) => return doctor::run(cli, args).await,
+        Command::Menu => return Err(Error::Config("menu requires an interactive terminal")),
+        _ => {}
+    }
     if let Command::Paperless { command } = &cli.command {
         return paperless_cli::run(cli, command).await;
     }
@@ -1180,7 +1309,15 @@ async fn run(cli: &Cli) -> Result<(Value, u8)> {
         | Command::Login { .. }
         | Command::Logout => unreachable!(),
         Command::Tenants => unreachable!(),
-        Command::Paperless { .. } => unreachable!(),
+        Command::Paperless { .. }
+        | Command::Check(_)
+        | Command::Status(_)
+        | Command::Deliver(_)
+        | Command::Verify(_)
+        | Command::Profile { .. }
+        | Command::Destination { .. }
+        | Command::Doctor(_)
+        | Command::Menu => unreachable!(),
         Command::Inbox {
             command: InboxCommand::List(args),
         } => list(&mut client, Source::Inbox, args).await,
@@ -1235,6 +1372,7 @@ async fn run(cli: &Cli) -> Result<(Value, u8)> {
                 output: output(cli, args.output.as_deref())?,
                 page_size: args.page_size,
                 max_pages: args.max_pages,
+                max_documents: 100_000,
             };
             let (mut report, mut code) = sync(cli, &mut client, &mailbox, &args).await?;
             if use_paperless {
@@ -1262,7 +1400,26 @@ async fn run(cli: &Cli) -> Result<(Value, u8)> {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    let mut cli = match Cli::try_parse() {
+    let mut arguments: Vec<_> = std::env::args_os().collect();
+    let parsed = match Cli::try_parse_from(&arguments) {
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::MissingSubcommand
+                    | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) && !arguments.iter().any(|a| a == "--json") =>
+        {
+            if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+                let _ = Cli::command().print_help();
+                let _ = writeln!(io::stdout().lock());
+                return 0.into();
+            }
+            arguments.push("menu".into());
+            Cli::try_parse_from(arguments)
+        }
+        other => other,
+    };
+    let mut cli = match parsed {
         Ok(cli) => cli,
         Err(error)
             if matches!(
@@ -1290,6 +1447,17 @@ async fn main() -> std::process::ExitCode {
             return 2.into();
         }
     };
+    if !matches!(cli.command, Command::Doctor(_) | Command::Menu)
+        && let Err(error) = load_profile(&mut cli)
+    {
+        return print_error(&cli, error);
+    }
+    if matches!(cli.command, Command::Menu) {
+        return match menu(&cli).await {
+            Ok(code) => code.into(),
+            Err(error) => print_error(&cli, error),
+        };
+    }
     let missing = if cli.profile.is_none() {
         match &cli.command {
             Command::Login { .. } | Command::Logout => {
@@ -1321,86 +1489,354 @@ async fn main() -> std::process::ExitCode {
         let _ = writeln!(io::stderr().lock(), "{diagnostic}");
         return 2.into();
     }
-    if let Err(error) = load_profile(&mut cli) {
-        return print_error(&cli, error);
+
+    match execute(&mut cli).await {
+        Ok(code) => code.into(),
+        Err(error) => print_error(&cli, error),
     }
+}
+
+async fn execute(cli: &mut Cli) -> Result<u8> {
     if matches!(
         cli.command,
         Command::Setup { .. } | Command::Browse { .. } | Command::Login { .. }
     ) {
-        let result = (|| {
-            if cli.json || cli.password_stdin {
-                return Err(Error::Config(
-                    "setup, browse and login need an interactive terminal; omit --json and --password-stdin",
-                ));
-            }
-            if env_secret("EPOST_BEARER_TOKEN")?.is_some() || env_secret("EPOST_API_KEY")?.is_some()
-            {
-                return Err(Error::Config(
-                    "setup and browse use password sign-in; unset bearer/API-key variables or use the script commands",
-                ));
-            }
-            interactive::Terminal::new()
-        })();
-        let mut terminal = match result {
-            Ok(terminal) => terminal,
-            Err(error) => return print_error(&cli, error),
-        };
-        return match interactive::run(&cli, &mut terminal).await {
-            Ok(code) => code.into(),
-            Err(error) => print_error(&cli, error),
+        if cli.json || cli.password_stdin || cli.non_interactive {
+            return Err(Error::Config(
+                "setup, browse and login need an interactive terminal; omit --json, --password-stdin and --non-interactive",
+            ));
+        }
+        if env_secret("EPOST_BEARER_TOKEN")?.is_some() || env_secret("EPOST_API_KEY")?.is_some() {
+            return Err(Error::Config(
+                "setup and browse use password sign-in; unset bearer/API-key variables or use the script commands",
+            ));
+        }
+        return if tui::available() {
+            interactive::run(cli, &mut tui::TuiPrompts::new()?).await
+        } else {
+            interactive::run(cli, &mut interactive::Terminal::new()?).await
         };
     }
-    let (payload, code) = match run(&cli).await {
-        Ok((data, code)) => (
-            json!({"schema_version": 1, "status": if code == 0 { "ok" } else { "partial" }, "data": data}),
-            code,
-        ),
-        Err(error) => {
-            return print_error(&cli, error);
-        }
-    };
-    if matches!(cli.command, Command::Sync(_)) && !cli.json && io::stdout().is_terminal() {
-        let mut lines = sync_summary(&payload["data"], code);
-        lines.extend(paperless_cli::sync_lines(&payload["data"]));
-        for line in lines {
-            if writeln!(io::stdout().lock(), "{line}").is_err() {
-                return 1.into();
+    let live = !cli.json
+        && !cli.no_progress
+        && tui::available()
+        && !matches!(
+            cli.command,
+            Command::Destination { .. }
+                | Command::Profile { .. }
+                | Command::Paperless {
+                    command: paperless_cli::PaperlessCommand::Setup { .. }
+                }
+        );
+    if live && !matches!(cli.command, Command::Doctor(_)) {
+        let needs_source = matches!(
+            cli.command,
+            Command::Check(_)
+                | Command::Status(_)
+                | Command::Sync(_)
+                | Command::Inbox { .. }
+                | Command::Archive { .. }
+                | Command::Show { .. }
+                | Command::Download { .. }
+                | Command::Tenants
+        );
+        if needs_source
+            && env_secret("EPOST_BEARER_TOKEN")?.is_none()
+            && env_secret("EPOST_API_KEY")?.is_none()
+        {
+            use interactive::Prompts;
+            let credentials = tui::TuiPrompts::new()?.credentials(cli);
+            match credentials {
+                Ok(value) => cli.prepared_credentials = Some(value),
+                Err(error) if matches!(cli.command, Command::Check(_)) => {
+                    eprintln!("ePost sign-in: {error}");
+                }
+                Err(error) => return Err(error),
             }
         }
-        return code.into();
-    }
-    if matches!(cli.command, Command::Paperless { .. }) && !cli.json {
-        for line in paperless_cli::summary(&payload["data"], code) {
-            if writeln!(io::stdout().lock(), "{line}").is_err() {
-                return 1.into();
+        let prepare = match &cli.command {
+            Command::Check(args) if !args.local => {
+                Some((args.destinations.clone(), args.output.clone()))
             }
-        }
-        return code.into();
-    }
-    if matches!(
-        cli.command,
-        Command::Inbox {
-            command: InboxCommand::Check(_)
-        }
-    ) && !cli.json
-        && io::stdout().is_terminal()
-    {
-        for line in check_summary(&payload["data"], code) {
-            if writeln!(io::stdout().lock(), "{line}").is_err() {
-                return 1.into();
+            Command::Deliver(args) | Command::Verify(args) => {
+                Some((args.destinations.clone(), args.output.clone()))
             }
+            _ => None,
+        };
+        if let Some((names, path)) = prepare {
+            destination_cli::prepare(cli, &names, path.as_deref())?;
         }
-        return code.into();
+        let legacy_output = match &cli.command {
+            Command::Sync(args) if args.paperless => Some(args.output.clone()),
+            Command::Paperless {
+                command:
+                    paperless_cli::PaperlessCommand::Upload { output, .. }
+                    | paperless_cli::PaperlessCommand::Reconcile { output, .. },
+            } => Some(output.clone()),
+            _ => None,
+        };
+        if let Some(explicit) = legacy_output {
+            let (root, store) = destination_cli::open_store(cli, explicit.as_deref())?;
+            let target = epost_cli::delivery::load_target(&store)?;
+            cli.prepared_paperless_token = Some(paperless_cli::token(cli, &root, &store, &target)?);
+        }
+        // All prompts happen before live progress owns the terminal.
+        cli.non_interactive = true;
     }
-    let rendered = if cli.json {
-        serde_json::to_string(&payload)
+    let result = if live {
+        tui::operation("ePost", run(cli)).await
     } else {
-        serde_json::to_string_pretty(&payload)
+        run(cli).await
     };
-    match rendered {
-        Ok(text) if writeln!(io::stdout().lock(), "{text}").is_ok() => code.into(),
-        _ => 1.into(),
+    let (data, code) = result?;
+    if cli.json {
+        writeln!(
+            io::stdout().lock(),
+            "{}",
+            json!({"schema_version":1,"status":if code==0{"ok"}else{"partial"},"data":data})
+        )?;
+    } else {
+        for line in human_summary(cli, &data, code) {
+            writeln!(io::stdout().lock(), "{line}")?;
+        }
+    }
+    Ok(code)
+}
+
+fn human_summary(cli: &Cli, data: &Value, code: u8) -> Vec<String> {
+    match &cli.command {
+        Command::Check(_)
+        | Command::Status(_)
+        | Command::Deliver(_)
+        | Command::Verify(_)
+        | Command::Profile { .. } => modern::summary(data, code),
+        Command::Doctor(_) => doctor::summary(data),
+        Command::Destination { .. } => destination_cli::summary(data),
+        Command::Sync(_) => {
+            let mut lines = sync_summary(data, code);
+            lines.extend(paperless_cli::sync_lines(data));
+            lines
+        }
+        Command::Paperless { .. } => paperless_cli::summary(data, code),
+        Command::Inbox {
+            command: InboxCommand::Check(_),
+        } => check_summary(data, code),
+        _ => readable_metadata(data),
+    }
+}
+fn readable_metadata(data: &Value) -> Vec<String> {
+    if let Some(rows) = data.as_array().or_else(|| data["letters"].as_array()) {
+        let mut lines = vec![format!("{} items observed.", rows.len())];
+        for (i, row) in rows.iter().take(100).enumerate() {
+            let title = row["letterTitle"]
+                .as_str()
+                .or_else(|| row["directoryName"].as_str())
+                .or_else(|| row["company_name"].as_str())
+                .unwrap_or("Unnamed item");
+            lines.push(format!("{}. {}", i + 1, interactive::safe_line(title)));
+        }
+        if rows.len() > 100 {
+            lines.push("Use --json for the complete metadata result.".into());
+        }
+        return lines;
+    }
+    if let Some(status) = data["status"].as_str() {
+        return vec![format!("Document: {}.", interactive::safe_line(status))];
+    }
+    if data["password_forgotten"] == true {
+        return vec!["Saved ePost password forgotten. Mailbox settings retained.".into()];
+    }
+    vec!["Command finished. Use --json for structured metadata.".into()]
+}
+
+async fn menu(base: &Cli) -> Result<u8> {
+    if base.json || base.non_interactive || !io::stdin().is_terminal() {
+        return Err(Error::Config(
+            "open an interactive terminal for the menu; use epost check inbox --non-interactive for automation",
+        ));
+    }
+    let mut current = base.clone();
+    let mut last = 0;
+    loop {
+        current.command = Command::Menu;
+        current.selected_profile = None;
+        if let Err(error) = load_profile(&mut current) {
+            eprintln!("Startup needs attention: {error}. Doctor and Settings remain available.");
+            current.selected_profile = None;
+        }
+        let destinations = if current.selected_profile.is_some() {
+            match destination_cli::open_store(&current, None)
+                .and_then(|(_, store)| epost_cli::destinations::list(&store))
+            {
+                Ok(items) => items.into_iter().map(|d| d.name).collect(),
+                Err(error) => {
+                    eprintln!("Store needs attention: {error}. Open Doctor or Problems.");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let action = if tui::available() {
+            tui::home(
+                current.profile.as_deref(),
+                &destinations,
+                current.selected_profile.is_none(),
+            )?
+        } else {
+            use interactive::Prompts;
+            let mut ui = interactive::Terminal::new()?;
+            ui.line("1 Check inbox · 2 Inbox · 3 Archive · 4 Deliver · 5 Problems · 6 Doctor · 7 Destinations · 8 Setup · 9 Settings · q Quit")?;
+            match ui.input("Choose: ")?.as_deref() {
+                Some("1") => tui::MenuAction::CheckInbox,
+                Some("2") => tui::MenuAction::BrowseInbox,
+                Some("3") => tui::MenuAction::BrowseArchive,
+                Some("4") => tui::MenuAction::Deliver,
+                Some("5") => tui::MenuAction::Problems,
+                Some("6") => tui::MenuAction::Doctor,
+                Some("7") => tui::MenuAction::Destinations,
+                Some("8") => tui::MenuAction::Setup,
+                Some("9") => tui::MenuAction::Settings,
+                None => tui::MenuAction::Quit,
+                _ => continue,
+            }
+        };
+        let mut cli = current.clone();
+        cli.non_interactive = base.non_interactive;
+        cli.prepared_credentials = None;
+        cli.prepared_paperless_token = None;
+        cli.prepared_destination_tokens.clear();
+        cli.prepared_destination_failures.clear();
+        cli.command = match action {
+            tui::MenuAction::Quit => return Ok(last),
+            tui::MenuAction::Setup => {
+                cli.selected_profile = None;
+                Command::Setup {
+                    output: None,
+                    scope: Some(Scope::Inbox),
+                }
+            }
+            tui::MenuAction::CheckInbox => Command::Check(modern::ScopeArgs {
+                target: modern::Location::Inbox,
+                destinations: Vec::new(),
+                local: false,
+                limit: 1000,
+                output: None,
+            }),
+            tui::MenuAction::BrowseInbox => Command::Browse {
+                location: Some(modern::Location::Inbox),
+                output: None,
+                page_size: 10,
+            },
+            tui::MenuAction::BrowseArchive => Command::Browse {
+                location: Some(modern::Location::Archive),
+                output: None,
+                page_size: 10,
+            },
+            tui::MenuAction::Deliver => Command::Deliver(modern::DeliveryArgs {
+                destinations: Vec::new(),
+                limit: 1000,
+                output: None,
+            }),
+            tui::MenuAction::Doctor | tui::MenuAction::Problems => {
+                Command::Doctor(doctor::DoctorArgs {
+                    destinations: Vec::new(),
+                    offline: matches!(action, tui::MenuAction::Problems),
+                })
+            }
+            tui::MenuAction::Destinations => {
+                use interactive::Prompts;
+                let answer = if tui::available() {
+                    tui::TuiPrompts::new()?.prompt(
+                        "Destinations: list / add / edit NAME / remove NAME: ",
+                        false,
+                    )?
+                } else {
+                    interactive::Terminal::new()?
+                        .input("Destinations: list / add / edit NAME / remove NAME: ")?
+                };
+                let Some(answer) = answer else { continue };
+                let words = answer.split_whitespace().collect::<Vec<_>>();
+                let command = match words.as_slice() {
+                    ["list"] | [] => destination_cli::DestinationCommand::List,
+                    ["add"] => destination_cli::DestinationCommand::Add {
+                        name: None,
+                        folder: None,
+                        url: None,
+                    },
+                    ["edit", name] => destination_cli::DestinationCommand::Edit {
+                        name: (*name).into(),
+                    },
+                    ["remove", name] => destination_cli::DestinationCommand::Remove {
+                        name: (*name).into(),
+                        yes: false,
+                    },
+                    _ => {
+                        eprintln!("Choose list, add, edit NAME or remove NAME.");
+                        continue;
+                    }
+                };
+                Command::Destination { command }
+            }
+            tui::MenuAction::Settings => {
+                use interactive::Prompts;
+                let answer = if tui::available() {
+                    tui::TuiPrompts::new()?.prompt(
+                        "Settings: profiles / use NAME / setup / login / login remember / logout: ",
+                        false,
+                    )?
+                } else {
+                    interactive::Terminal::new()?.input(
+                        "Settings: profiles / use NAME / setup / login / login remember / logout: ",
+                    )?
+                };
+                let Some(answer) = answer else { continue };
+                let words = answer.split_whitespace().collect::<Vec<_>>();
+                match words.as_slice() {
+                    ["profiles"] => Command::Profile {
+                        command: modern::ProfileCommand::List,
+                    },
+                    ["use", name] => Command::Profile {
+                        command: modern::ProfileCommand::Use {
+                            name: (*name).into(),
+                        },
+                    },
+                    ["setup"] => {
+                        cli.selected_profile = None;
+                        Command::Setup {
+                            output: None,
+                            scope: Some(Scope::Inbox),
+                        }
+                    }
+                    ["login"] => Command::Login { remember: false },
+                    ["login", "remember"] => Command::Login { remember: true },
+                    ["logout"] => Command::Logout,
+                    _ => {
+                        eprintln!(
+                            "Choose profiles, use NAME, setup, login, login remember or logout."
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+        match execute(&mut cli).await {
+            Ok(code) => last = code,
+            Err(error) => {
+                last = error.exit_code();
+                eprintln!("{error}");
+            }
+        }
+        if last == 0
+            && let Command::Profile {
+                command: modern::ProfileCommand::Use { name },
+            } = &cli.command
+        {
+            current.profile = Some(name.clone());
+        }
+        use interactive::Prompts;
+        let _ =
+            interactive::Terminal::new()?.input("Enter returns to the menu (q also returns): ")?;
     }
 }
 

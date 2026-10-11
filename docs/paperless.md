@@ -1,6 +1,53 @@
 # Paperless-ngx delivery
 
-Paperless is an optional delivery destination. Normal ePost sync stays local unless you explicitly add `--paperless`. Delivery currently supports validated PDFs only. Local files remain in the ePost store after delivery.
+Paperless is an optional configured destination. `epost check inbox` uses every configured destination. The legacy `sync` command stays local unless you explicitly add `--paperless`. Delivery currently supports validated PDFs only. Local files remain in the ePost store after delivery.
+
+## Named destinations and metadata
+
+Use `epost destination add` for current guided setup; `epost destination edit NAME`
+retains history and offers token replacement. The wizard proposes **Inbox**
+with `is_inbox_tag=true` and **ePost** as a regular source tag. You can choose
+custom names and extra tags. Existing migrated **ePost Inbox** is preserved.
+An existing tag with the wrong inbox flag is never silently modified. Creation
+of tags and selected custom fields is explicit; setup uploads no documents.
+
+Document types are optional. The default leaves classification to Paperless.
+Choose an existing fixed type, or an explicit mapping such as
+`invoice=1,contract=2` using IDs from that instance. Only an unambiguous known
+upstream `documentTypes` match is sent; missing/conflicting metadata is omitted.
+The transport `letterType` is not a semantic document type. The wizard does not
+create types or enable server workflows/classifiers.
+
+Optional provenance mappings create/select **Text** custom fields for document
+ID, received timestamp, original filename and raw document types, plus static
+text values. A usable `letterTitle` supplies the upload title. Received time is
+preserved as supplied by ePost and **never sent as Paperless's document issue
+or creation date**. Optional fields absent from ePost are omitted. Sender IDs
+are not converted into invented correspondents, and invoice amounts/due dates
+are not inferred from unavailable metadata.
+
+Tags and metadata apply to future uploads. Accepting edit defaults preserves
+existing optional settings; replacing them requires an explicit choice. Repeats
+do not restore tags removed during human review. A Paperless upload becomes
+confirmed only after ingestion returns a document ID, the downloaded original
+matches the local PDF's bytes/hash, and its configured initial tags are present.
+Later ordinary checks report cached confirmation; `epost verify` freshly audits
+existing originals and does not upload new PDFs. Pending/uncertain ingestion
+remains visible and is resumed without blind reposting.
+
+Folder destinations use a private, namespace-bound store with atomic verified
+PDF copies. Files and delivery history remain after removing configuration.
+
+With several Paperless instances, use separate Keychain tokens or per-destination
+environment variables. Their injective name is
+`EPOST_DESTINATION_<UPPERCASE_HEX_OF_UTF8_NAME>_TOKEN`, e.g.
+`EPOST_DESTINATION_6D61696E_TOKEN` for `main`. A generic `PAPERLESS_TOKEN` or token
+file is refused when ambiguous across configured instances. Tokens are not CLI
+argument values or saved config. Doctor probes a fixed unauthenticated API route
+before reading a token; login redirects are reported with LAN/proxy guidance.
+
+See [daily commands](commands.md). The remaining sections document the original
+single-target commands, supported while named configuration is absent.
 
 ## First setup
 
@@ -34,7 +81,7 @@ An HTTPS API must be reachable with the token alone. Redirects are reported with
 
 ## Delivery and recovery
 
-The CLI verifies each local PDF, records upload intent durably, uploads it once with the configured tags, then polls the asynchronous consumption task. It confirms the original's byte count and SHA-256 through a separate download before recording delivery. New confirmations also check that the intended tags are present and that the inbox flag is still enabled. PDFs use deterministic opaque filenames for recovery; document titles/correspondents/dates are not copied from ePost metadata in this version.
+The CLI verifies each local PDF, records upload intent durably, uploads it once with the configured tags, then polls the asynchronous consumption task. It confirms the original's byte count and SHA-256 through a separate download before recording delivery. New confirmations also check that the intended tags are present and that the inbox flag is still enabled. PDFs use deterministic opaque filenames for recovery; the legacy single-target uploader does not copy titles, correspondents or dates. Named destinations support the optional title and provenance mappings described above; receipt time is never used as an issue date.
 
 Pending task IDs persist across runs. If a connection or crash loses the upload receipt, retrying looks for the exact deterministic original filename and verifies its bytes. An empty search does not prove the upload was never accepted, so uncertain uploads are never automatically submitted again. A terminal ingestion failure similarly requires reconciliation or manual correction. Existing copies with different filenames are not guessed or adopted automatically.
 
@@ -52,7 +99,7 @@ epost-cli --profile personal paperless reconcile synthetic-letter-id \
 
 Local `paperless status` describes recorded state only; it does not establish current server health. Delivery reports contain counts, hashed document references, Paperless document IDs and redacted errors; `access_blocked` distinguishes redirected access from `authentication_failed`. Exit 0 means all supported work in that run was verified; exit 2 indicates pending/uncertain/failed/unsupported/deferred work, exit 3 authentication failure, and exit 4 local integrity failure. A standalone setup redirect returns exit 1 with routing/access guidance. A combined sync retains its ePost result and adds Paperless results/errors. If ePost was already partial or failed, delivery cannot erase that status.
 
-Delivery state is private, atomic and locked alongside the existing mailbox store. An existing ledger is bound to its destination URL and namespace; rebinding it to a different server is rejected. Instance migration, deduplication across separate stores, automatic retry of failed uploads, metadata mapping and ePost archive mutations remain outside this version.
+Delivery state is private, atomic and locked alongside the existing mailbox store. An existing ledger is bound to its destination URL and namespace; rebinding it to a different server is rejected. Instance migration, deduplication across separate stores, automatic retry of failed uploads and ePost archive mutations remain outside this version. Named destinations support selected metadata mappings.
 
 ## Contract and verification
 
