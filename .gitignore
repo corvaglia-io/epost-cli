@@ -11,4 +11,9 @@
 /runs/
 /epost.toml
 /epost.local.toml
+/config.json
+/config.local.json
+/.config.json.lock
+/.epost-cli/
+/epost-cli-data/
 .DS_Store

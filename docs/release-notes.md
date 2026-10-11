@@ -1,4 +1,9 @@
-Initial development release of the unofficial epost-cli Rust CLI and library.
+Development release of the unofficial epost-cli Rust CLI and library.
+
+- Guided setup with retrying prompts and explicit numbered mailbox selection.
+- Readable inbox/archive browsing and numbered downloads with one sign-in per session.
+- Private, credential-free profiles for short download/sync commands.
+- Repeat syncs verify saved files and fetch only unsaved content.
 
 - Read-only inbox and archive metadata/document retrieval.
 - Explicit private/business mailbox selection, password/bearer authentication and business API keys.

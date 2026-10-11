@@ -1,12 +1,17 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use epost_cli::{
     api::{ApiClient, ClientOptions, Environment},
+    config::{self, Profile, SyncScope as Scope},
     error::{Error, Result},
     models::{Letter, Mailbox, MailboxKind},
     pagination::{self, Inventory, Source},
     secret::Secret,
     storage::{SaveResult, Store},
 };
+
+mod interactive;
+#[cfg(test)]
+mod interactive_tests;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -23,8 +28,17 @@ struct Cli {
     /// Compact, structured JSON on stdout; diagnostics stay on stderr.
     #[arg(long, global = true)]
     json: bool,
-    #[arg(long, global = true, value_enum, default_value = "production")]
-    environment: Environment,
+    /// API environment (production unless a selected profile supplies it).
+    #[arg(long, global = true, value_enum)]
+    environment: Option<Environment>,
+    /// Use a mailbox/output/scope profile saved by setup. No credentials are saved.
+    #[arg(long, global = true)]
+    profile: Option<String>,
+    /// Profile configuration file; otherwise use the platform configuration folder.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    #[arg(skip)]
+    selected_profile: Option<Profile>,
     #[arg(long, global = true, value_enum)]
     tenant_kind: Option<MailboxKind>,
     #[arg(long, global = true)]
@@ -49,6 +63,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Guided sign-in and explicit mailbox selection; save a profile without credentials.
+    Setup {
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, value_enum)]
+        scope: Option<Scope>,
+    },
+    /// Sign in once, browse readable inbox/archive pages, and download by number.
+    Browse {
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        page_size: u32,
+    },
     /// Discover accessible tenants; never selects a mailbox automatically.
     Tenants,
     /// Retrieve inbox metadata.
@@ -67,7 +95,7 @@ enum Command {
     Download {
         letter_id: String,
         #[arg(long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
     },
     /// Retrieve documents across an explicitly selected inbox/archive scope.
     Sync(SyncArgs),
@@ -104,24 +132,62 @@ struct ListArgs {
     max_pages: u32,
 }
 
-#[derive(Clone, Copy, ValueEnum, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Scope {
-    Inbox,
-    Archive,
-    Both,
-}
-
 #[derive(Args)]
 struct SyncArgs {
     #[arg(long, value_enum)]
-    scope: Scope,
+    scope: Option<Scope>,
     #[arg(long)]
-    output: PathBuf,
+    output: Option<PathBuf>,
     #[arg(long, default_value_t = 48, value_parser = clap::value_parser!(u32).range(1..=1000))]
     page_size: u32,
     #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=100000))]
     max_pages: u32,
+}
+
+struct ResolvedSyncArgs {
+    scope: Scope,
+    output: PathBuf,
+    page_size: u32,
+    max_pages: u32,
+}
+
+fn environment(cli: &Cli) -> Environment {
+    cli.selected_profile
+        .as_ref()
+        .map(|profile| profile.environment)
+        .or(cli.environment)
+        .unwrap_or(Environment::Production)
+}
+
+fn output(cli: &Cli, explicit: Option<&Path>) -> Result<PathBuf> {
+    explicit
+        .map(Path::to_path_buf)
+        .or_else(|| cli.selected_profile.as_ref().map(|p| p.output.clone()))
+        .ok_or(Error::Config(
+            "supply --output or use a profile saved by setup",
+        ))
+}
+
+fn load_profile(cli: &mut Cli) -> Result<()> {
+    if matches!(cli.command, Command::Setup { .. }) {
+        return Ok(());
+    }
+    if let Some(name) = &cli.profile {
+        if cli.tenant_kind.is_some()
+            || cli.tenant_id.is_some()
+            || cli.company_id.is_some()
+            || cli.environment.is_some()
+        {
+            return Err(Error::Config(
+                "a profile supplies mailbox and environment; omit the explicit selection flags",
+            ));
+        }
+        cli.selected_profile = Some(config::load_profile(
+            &config::path(cli.config.as_deref())?,
+            name,
+        )?);
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -209,6 +275,9 @@ fn password(cli: &Cli) -> Result<(String, Secret)> {
 }
 
 fn mailbox(cli: &Cli) -> Result<Mailbox> {
+    if let Some(profile) = &cli.selected_profile {
+        return Ok(profile.mailbox.clone());
+    }
     let tenant_id = cli
         .tenant_id
         .clone()
@@ -235,7 +304,7 @@ fn client(cli: &Cli, mailbox: Option<Mailbox>) -> Result<ApiClient> {
     };
     match cli.mock_url.as_deref() {
         Some(url) => ApiClient::for_test(url, mailbox, options),
-        None => ApiClient::new(cli.environment, mailbox, options),
+        None => ApiClient::new(environment(cli), mailbox, options),
     }
 }
 
@@ -270,7 +339,7 @@ fn namespace(cli: &Cli, mailbox: &Mailbox) -> Result<String> {
     let origin = cli
         .mock_url
         .as_deref()
-        .unwrap_or(cli.environment.base_url());
+        .unwrap_or(environment(cli).base_url());
     serde_json::to_string(&(origin, &mailbox.tenant_id, mailbox.company_id, mailbox.kind))
         .map_err(|_| Error::Config("cannot construct mailbox namespace"))
 }
@@ -363,7 +432,7 @@ async fn sync(
     cli: &Cli,
     client: &mut ApiClient,
     mailbox: &Mailbox,
-    args: &SyncArgs,
+    args: &ResolvedSyncArgs,
 ) -> Result<(Value, u8)> {
     let mut store = Store::open(&args.output, &namespace(cli, mailbox)?)?;
     let mut report = SyncReport {
@@ -531,6 +600,7 @@ async fn run(cli: &Cli) -> Result<(Value, u8)> {
     let mut client = client(cli, Some(mailbox.clone()))?;
     authenticate(cli, &mut client, &mailbox).await?;
     match &cli.command {
+        Command::Setup { .. } | Command::Browse { .. } => unreachable!(),
         Command::Tenants => unreachable!(),
         Command::Inbox {
             command: InboxCommand::List(args),
@@ -559,7 +629,8 @@ async fn run(cli: &Cli) -> Result<(Value, u8)> {
         }
         Command::Show { letter_id } => Ok((value(client.letter(letter_id).await?)?, 0)),
         Command::Download { letter_id, output } => {
-            let mut store = Store::open(Path::new(output), &namespace(cli, &mailbox)?)?;
+            let output = self::output(cli, output.as_deref())?;
+            let mut store = Store::open(&output, &namespace(cli, &mailbox)?)?;
             let letter = client.letter(letter_id).await?;
             if letter.id.as_deref() != Some(letter_id) {
                 return Err(Error::InvalidResponse(
@@ -570,13 +641,26 @@ async fn run(cli: &Cli) -> Result<(Value, u8)> {
             let exit = if supported(&record) { 0 } else { 2 };
             Ok((value(record)?, exit))
         }
-        Command::Sync(args) => sync(cli, &mut client, &mailbox, args).await,
+        Command::Sync(args) => {
+            let args = ResolvedSyncArgs {
+                scope: args
+                    .scope
+                    .or_else(|| cli.selected_profile.as_ref().map(|p| p.scope))
+                    .ok_or(Error::Config(
+                        "supply --scope or use a profile saved by setup",
+                    ))?,
+                output: output(cli, args.output.as_deref())?,
+                page_size: args.page_size,
+                max_pages: args.max_pages,
+            };
+            sync(cli, &mut client, &mailbox, &args).await
+        }
     }
 }
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    let cli = match Cli::try_parse() {
+    let mut cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error)
             if matches!(
@@ -604,20 +688,63 @@ async fn main() -> std::process::ExitCode {
             return 2.into();
         }
     };
+    let missing = if cli.profile.is_none() {
+        match &cli.command {
+            Command::Sync(args) if args.scope.is_none() || args.output.is_none() => {
+                Some("sync requires --scope and --output, or a profile saved by setup")
+            }
+            Command::Download { output: None, .. } => {
+                Some("download requires --output, or a profile saved by setup")
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(message) = missing {
+        let diagnostic = if cli.json {
+            json!({"schema_version": 1, "status": "error", "exit_code": 2, "error": message})
+                .to_string()
+        } else {
+            message.into()
+        };
+        let _ = writeln!(io::stderr().lock(), "{diagnostic}");
+        return 2.into();
+    }
+    if let Err(error) = load_profile(&mut cli) {
+        return print_error(&cli, error);
+    }
+    if matches!(cli.command, Command::Setup { .. } | Command::Browse { .. }) {
+        let result = (|| {
+            if cli.json || cli.password_stdin {
+                return Err(Error::Config(
+                    "setup and browse need an interactive terminal; omit --json and --password-stdin",
+                ));
+            }
+            if env_secret("EPOST_BEARER_TOKEN")?.is_some() || env_secret("EPOST_API_KEY")?.is_some()
+            {
+                return Err(Error::Config(
+                    "setup and browse use password sign-in; unset bearer/API-key variables or use the script commands",
+                ));
+            }
+            interactive::Terminal::new()
+        })();
+        let mut terminal = match result {
+            Ok(terminal) => terminal,
+            Err(error) => return print_error(&cli, error),
+        };
+        return match interactive::run(&cli, &mut terminal).await {
+            Ok(code) => code.into(),
+            Err(error) => print_error(&cli, error),
+        };
+    }
     let (payload, code) = match run(&cli).await {
         Ok((data, code)) => (
             json!({"schema_version": 1, "status": if code == 0 { "ok" } else { "partial" }, "data": data}),
             code,
         ),
         Err(error) => {
-            let code = error.exit_code();
-            let diagnostic = if cli.json {
-                json!({"schema_version": 1, "status": "error", "exit_code": code, "error": error.to_string()}).to_string()
-            } else {
-                error.to_string()
-            };
-            let _ = writeln!(io::stderr().lock(), "{diagnostic}");
-            return code.into();
+            return print_error(&cli, error);
         }
     };
     let rendered = if cli.json {
@@ -629,4 +756,15 @@ async fn main() -> std::process::ExitCode {
         Ok(text) if writeln!(io::stdout().lock(), "{text}").is_ok() => code.into(),
         _ => 1.into(),
     }
+}
+
+fn print_error(cli: &Cli, error: Error) -> std::process::ExitCode {
+    let code = error.exit_code();
+    let diagnostic = if cli.json {
+        json!({"schema_version": 1, "status": "error", "exit_code": code, "error": error.to_string()}).to_string()
+    } else {
+        error.to_string()
+    };
+    let _ = writeln!(io::stderr().lock(), "{diagnostic}");
+    code.into()
 }
