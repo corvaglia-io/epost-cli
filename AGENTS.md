@@ -33,4 +33,4 @@ Do not confuse archive retrieval with moving a letter into the archive.
 
 ## Delivery
 
-Work on a feature branch and produce a reviewable draft PR. Do not merge, force-push, publish packages/binaries or change repository access/settings. Preserve existing changes. License choice is pending; do not invent approval for a license.
+Work on a feature branch and produce a reviewable draft PR. Do not merge, force-push, publish packages/binaries or change repository access/settings. Preserve existing changes. The maintainer selected the MIT license; preserve LICENSE and the package license declaration.

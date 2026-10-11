@@ -34,4 +34,4 @@ Add minimal GitHub Actions CI with read-only permissions and formatting, clippy 
 
 Read docs/api-brief.txt for exact API shape notes and authoritative links. Update README to describe installation, examples, configuration, return values, credential separation, scheduler-friendly use, known limitations and what was actually tested. Examples must use invented values only. Explain that downloading mail does not perform any required manual acceptance or subsequent action on its contents.
 
-Provide a short implementation summary, test results, limitations and unresolved provider questions. Clearly identify mock-tested behavior and leave provider compatibility unverified until separately tested. License choice remains pending. Do not publish a crate, binary release or license without the maintainer's direction.
+Provide a short implementation summary, test results, limitations and unresolved provider questions. Clearly identify mock-tested behavior and leave provider compatibility unverified until separately tested. The maintainer selected MIT during implementation. Do not publish a crate or binary release without the maintainer's direction.
