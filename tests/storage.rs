@@ -155,6 +155,198 @@ fn saved_membership_lookup_is_read_only_and_validates_identifiers() {
 }
 
 #[test]
+fn downstream_inventory_and_reads_verify_saved_bytes_and_manifest() {
+    let fixture = Fixture::new();
+    let mut store = Store::open(&fixture.root, "synthetic-downstream").unwrap();
+    let saved = store.save("synthetic-id", "inbox", &pdf(), None).unwrap();
+    let inventory = store.saved_documents().unwrap();
+    assert_eq!(inventory.len(), 1);
+    assert_eq!(inventory[0].letter_id, "synthetic-id");
+    assert_eq!(inventory[0].sha256, saved.sha256);
+    assert_eq!(inventory[0].bytes, saved.bytes);
+    assert_eq!(inventory[0].media_kind, "pdf");
+    assert_eq!(store.read_saved("synthetic-id").unwrap(), pdf());
+    assert!(store.read_saved("unknown").is_err());
+    assert!(store.read_saved("").is_err());
+    fs::write(saved.path, b"changed synthetic file").unwrap();
+    assert!(store.read_saved("synthetic-id").is_err());
+    fs::write(fixture.manifest("synthetic-downstream"), b"{}").unwrap();
+    assert!(store.saved_documents().is_err());
+}
+
+#[test]
+fn private_state_accepts_only_fixed_names_and_detects_live_changes() {
+    let fixture = Fixture::new();
+    let mut store = Store::open(&fixture.root, "scope").unwrap();
+    for name in [
+        "../../outside",
+        "token.json",
+        "manifest.json",
+        "data",
+        "",
+        "paperless-target.json/extra",
+    ] {
+        assert!(store.read_private_state(name).is_err());
+        assert!(store.write_private_state(name, b"{}").is_err());
+    }
+    assert!(
+        store
+            .write_private_state("paperless-target.json", b"")
+            .is_err()
+    );
+    assert!(
+        store
+            .read_private_state("paperless-target.json")
+            .unwrap()
+            .is_none()
+    );
+    store
+        .write_private_state("paperless-target.json", b"{\"synthetic\":1}")
+        .unwrap();
+    assert_eq!(
+        store
+            .read_private_state("paperless-target.json")
+            .unwrap()
+            .unwrap(),
+        b"{\"synthetic\":1}"
+    );
+    store
+        .write_private_state("paperless-target.json", b"{\"synthetic\":2}")
+        .unwrap();
+    assert_eq!(
+        store
+            .read_private_state("paperless-target.json")
+            .unwrap()
+            .unwrap(),
+        b"{\"synthetic\":2}"
+    );
+    fs::write(
+        fixture.namespace("scope").join("paperless-target.json"),
+        b"{}",
+    )
+    .unwrap();
+    assert!(store.read_private_state("paperless-target.json").is_err());
+    assert!(
+        store
+            .write_private_state("paperless-target.json", b"{} ")
+            .is_err()
+    );
+}
+
+#[test]
+fn private_state_external_effect_obeys_atomic_commit_boundary() {
+    use epost_cli::error::Error;
+    use std::cell::Cell;
+    let fixture = Fixture::new();
+    let mut store = Store::open(&fixture.root, "scope").unwrap();
+    let effect = Cell::new(false);
+    let rollback = Cell::new(false);
+    let result = store.write_private_state_with_effect(
+        "paperless-target.json",
+        b"{}",
+        || {
+            effect.set(true);
+            Ok(())
+        },
+        |_| {
+            rollback.set(true);
+            Ok(())
+        },
+    );
+    assert!(result.is_ok());
+    assert!(effect.get());
+    assert!(!rollback.get());
+    effect.set(false);
+    assert!(
+        store
+            .write_private_state_with_effect(
+                "not-allowed.json",
+                b"{}",
+                || {
+                    effect.set(true);
+                    Ok(())
+                },
+                |_| Ok(())
+            )
+            .is_err()
+    );
+    assert!(!effect.get());
+    let before = store.read_private_state("paperless-target.json").unwrap();
+    assert!(
+        store
+            .write_private_state_with_effect(
+                "paperless-target.json",
+                b"{\"new\":1}",
+                || Err::<(), _>(Error::Config("synthetic effect failed")),
+                |_| Ok(())
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store.read_private_state("paperless-target.json").unwrap(),
+        before
+    );
+}
+
+#[test]
+fn private_state_failed_commit_rolls_back_effect() {
+    use std::cell::Cell;
+    let fixture = Fixture::new();
+    let mut store = Store::open(&fixture.root, "scope").unwrap();
+    let path = fixture.namespace("scope").join("paperless-target.json");
+    let rollback = Cell::new(false);
+    let result = store.write_private_state_with_effect(
+        "paperless-target.json",
+        b"{}",
+        || {
+            // A synthetic concurrent replacement after the preflight must be
+            // caught before commit, with the external fake effect undone.
+            fs::write(&path, b"conflicting synthetic bytes").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            Ok(23)
+        },
+        |undo| {
+            assert_eq!(undo, 23);
+            rollback.set(true);
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    assert!(rollback.get());
+    assert_eq!(fs::read(path).unwrap(), b"conflicting synthetic bytes");
+}
+
+#[cfg(unix)]
+#[test]
+fn private_state_symlinks_hardlinks_and_public_permissions_are_rejected() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for variant in 0..3 {
+        let fixture = Fixture::new();
+        let mut store = Store::open(&fixture.root, "scope").unwrap();
+        store
+            .write_private_state("paperless-target.json", b"{}")
+            .unwrap();
+        drop(store);
+        let state = fixture.namespace("scope").join("paperless-target.json");
+        match variant {
+            0 => {
+                fs::remove_file(&state).unwrap();
+                let external = fixture.base.join("synthetic-external");
+                fs::write(&external, b"{}").unwrap();
+                symlink(external, state).unwrap();
+            }
+            1 => fs::hard_link(&state, fixture.base.join("synthetic-hardlink")).unwrap(),
+            _ => fs::set_permissions(state, fs::Permissions::from_mode(0o644)).unwrap(),
+        }
+        assert!(Store::open(&fixture.root, "scope").is_err());
+    }
+}
+
+#[test]
 fn namespace_isolation_prevents_cross_tenant_collisions() {
     let fixture = Fixture::new();
     let bytes = pdf();

@@ -2,6 +2,25 @@
 
 These are candidates, not implemented features or commitments.
 
+## Optional ePost archiving after verified Paperless delivery
+
+Paperless delivery is implemented separately from ePost retrieval. It verifies
+ingestion, original bytes and initial review tags, while ePost remains read-only.
+The local delivery ledger already prevents routine repeat uploads; archiving
+ePost letters is not required for that purpose.
+
+A future explicit opt-in could archive a letter only after its destination copy
+is verified again and the intended mailbox is confirmed. It would need a reviewed
+provider mutation contract, registered-letter safeguards, durable reconciliation
+after ambiguous mutation responses, and independent synthetic tests. The policy
+must distinguish stored documents from reviewed/handled documents; delivery does
+not mean an invoice was paid or a deadline was handled. Prefer a separate command
+with a preview and explicit policy rather than changing normal sync behavior.
+
+Other Paperless candidates are document metadata mapping, migration between
+instances, controlled resubmission of terminal failed uploads, and optional
+Cloudflare Access service-token authentication. None is implemented today.
+
 ## Authenticated website download fallback
 
 An item can have accessible metadata while the public content endpoint returns

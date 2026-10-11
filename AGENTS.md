@@ -8,6 +8,13 @@ Implement a Rust CLI and reusable library for inbox and archive retrieval only. 
 
 Do not confuse archive retrieval with moving a letter into the archive.
 
+The maintainer also authorized an opt-in Paperless-ngx delivery destination.
+Uploading verified local PDFs and creating the explicitly configured delivery
+tags in Paperless are in scope. Keep ePost operations read-only. Paperless API
+tokens are supplied only at runtime or saved with explicit opt-in in the local
+macOS Keychain; never place them in config, reports, fixtures or CI. Develop and
+test this integration exclusively against synthetic localhost servers.
+
 ## Data and credentials
 
 - Use only public provider documentation and wholly synthetic test data.

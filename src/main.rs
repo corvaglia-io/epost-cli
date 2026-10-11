@@ -16,6 +16,7 @@ use epost_cli::{
 mod interactive;
 #[cfg(test)]
 mod interactive_tests;
+mod paperless_cli;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -58,6 +59,9 @@ struct Cli {
     /// Read only the password from stdin instead of EPOST_PASSWORD or a prompt.
     #[arg(long, global = true)]
     password_stdin: bool,
+    /// Read the Paperless token from a private file; never pass tokens as arguments.
+    #[arg(long, global = true)]
+    paperless_token_file: Option<PathBuf>,
     #[arg(long, global = true, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=120))]
     timeout_seconds: u64,
     #[arg(long, global = true, default_value_t = 2, value_parser = clap::value_parser!(u32).range(0..=5))]
@@ -117,6 +121,11 @@ enum Command {
     },
     /// Retrieve documents across an explicitly selected inbox/archive scope.
     Sync(SyncArgs),
+    /// Configure and deliver saved PDFs to Paperless-ngx; ePost stays read-only.
+    Paperless {
+        #[command(subcommand)]
+        command: paperless_cli::PaperlessCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -171,6 +180,9 @@ struct ListArgs {
 
 #[derive(Args)]
 struct SyncArgs {
+    /// Deliver saved PDFs to the explicitly configured Paperless destination after sync.
+    #[arg(long)]
+    paperless: bool,
     #[arg(long, value_enum)]
     scope: Option<Scope>,
     #[arg(long)]
@@ -1110,6 +1122,9 @@ fn check_summary(report: &Value, code: u8) -> Vec<String> {
 }
 
 async fn run(cli: &Cli) -> Result<(Value, u8)> {
+    if let Command::Paperless { command } = &cli.command {
+        return paperless_cli::run(cli, command).await;
+    }
     if matches!(cli.command, Command::Logout) {
         let name = cli
             .profile
@@ -1165,6 +1180,7 @@ async fn run(cli: &Cli) -> Result<(Value, u8)> {
         | Command::Login { .. }
         | Command::Logout => unreachable!(),
         Command::Tenants => unreachable!(),
+        Command::Paperless { .. } => unreachable!(),
         Command::Inbox {
             command: InboxCommand::List(args),
         } => list(&mut client, Source::Inbox, args).await,
@@ -1208,6 +1224,7 @@ async fn run(cli: &Cli) -> Result<(Value, u8)> {
             Ok((value(record)?, exit))
         }
         Command::Sync(args) => {
+            let use_paperless = args.paperless;
             let args = ResolvedSyncArgs {
                 scope: args
                     .scope
@@ -1219,7 +1236,26 @@ async fn run(cli: &Cli) -> Result<(Value, u8)> {
                 page_size: args.page_size,
                 max_pages: args.max_pages,
             };
-            sync(cli, &mut client, &mailbox, &args).await
+            let (mut report, mut code) = sync(cli, &mut client, &mailbox, &args).await?;
+            if use_paperless {
+                match paperless_cli::deliver_saved(cli, Some(&args.output), 1000, 60).await {
+                    Ok((delivery, delivery_code)) => {
+                        report["paperless"] = delivery;
+                        report["paperless_exit_code"] = json!(delivery_code);
+                        if code == 0 {
+                            code = delivery_code;
+                        }
+                    }
+                    Err(error) => {
+                        report["paperless_error"] = json!(error.to_string());
+                        report["paperless_exit_code"] = json!(error.exit_code());
+                        if code == 0 {
+                            code = error.exit_code();
+                        }
+                    }
+                }
+            }
+            Ok((report, code))
         }
     }
 }
@@ -1325,7 +1361,17 @@ async fn main() -> std::process::ExitCode {
         }
     };
     if matches!(cli.command, Command::Sync(_)) && !cli.json && io::stdout().is_terminal() {
-        for line in sync_summary(&payload["data"], code) {
+        let mut lines = sync_summary(&payload["data"], code);
+        lines.extend(paperless_cli::sync_lines(&payload["data"]));
+        for line in lines {
+            if writeln!(io::stdout().lock(), "{line}").is_err() {
+                return 1.into();
+            }
+        }
+        return code.into();
+    }
+    if matches!(cli.command, Command::Paperless { .. }) && !cli.json {
+        for line in paperless_cli::summary(&payload["data"], code) {
             if writeln!(io::stdout().lock(), "{line}").is_err() {
                 return 1.into();
             }

@@ -4,10 +4,12 @@
 pub mod api;
 pub mod config;
 pub mod credentials;
+pub mod delivery;
 pub mod error;
 pub mod keychain;
 pub mod models;
 pub mod pagination;
+pub mod paperless;
 pub mod progress;
 pub mod secret;
 pub mod storage;

@@ -8,6 +8,12 @@ This is a public, unofficial, best-effort client. Use public ePost documentation
 
 Only supporting authentication, inbox retrieval and archive retrieval are in scope. Sending and mailbox mutations are parked. In particular, do not accept/reject registered letters, mark them read, move/archive them, upload or delete anything.
 
+The maintainer subsequently authorized optional delivery of verified local PDFs
+to Paperless-ngx. Creating delivery tags and uploading to that external destination
+are in scope; the ePost mutation prohibition still applies. Use synthetic
+localhost Paperless services and fake tokens/stores for development and CI.
+See docs/paperless.md for the delivery contract and recovery behavior.
+
 ## Required behavior
 
 1. A reusable Rust library and the epost-cli binary, with a small command surface suitable for scripts and agents. Suggested commands: tenants, inbox list, inbox download, archive folders, archive list, archive download and a retrieval/sync command that makes its inbox/archive scope explicit.

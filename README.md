@@ -13,8 +13,9 @@ This client is tested against synthetic localhost servers. **Provider compatibil
 - Inbox metadata, archive folders/root/folder metadata, and document retrieval by letter ID.
 - Bounded pagination and retries, atomic local storage, hashes and repeat-run verification.
 - JSON reports and nonzero exit codes suitable for scripts, agents, n8n or Dagu.
+- Opt-in delivery of locally verified PDFs to Paperless-ngx, with an inbox review tag, resumable ingestion and original-byte verification.
 
-Mail operations are read-only. The client does not accept/reject registered letters, mark letters read, move/archive, send, upload, restore or delete mail. Authentication uses the documented POST endpoints. Downloading a document does not perform required manual acceptance or act on its contents.
+ePost mail operations are read-only. The client does not accept/reject registered letters, mark letters read, move/archive, send, upload, restore or delete ePost mail. Authentication uses the documented POST endpoints. Paperless delivery is a separate, explicitly enabled destination. Downloading or delivering a document does not perform required manual acceptance or act on its contents.
 
 ## Build and install
 
@@ -73,6 +74,10 @@ Keychain storage is local and not synchronized through iCloud. Entries are bound
 On another OS, `login` without `--remember` can convert a copied Mac profile to username-only prompting after successful sign-in. It cannot delete the saved password on the original Mac; use `logout` there if required.
 
 A selected profile supplies mailbox identity and environment. Explicit identity/environment flags cannot be combined with it. Download and sync may override the saved destination with `--output`; sync may override the saved scope with `--scope`. Without a profile, the existing explicit flags are required. Existing script commands retain their JSON reports; guided commands write their readable interface to stderr and reject `--json`/`--password-stdin`.
+
+### Paperless delivery
+
+For direct Paperless delivery, see [Paperless setup and recovery](docs/paperless.md). After configuring a destination with `epost-cli --profile personal paperless setup --url https://paperless.example.invalid --remember` (macOS), use `paperless upload` to deliver saved PDFs without an ePost login, or `sync --paperless` to retrieve and deliver. The token prompt is hidden; setup without `--remember` uses runtime token input instead. ePost archiving remains a [future improvement](docs/future-improvements.md).
 
 ### Inbox checks
 

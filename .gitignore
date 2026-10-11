@@ -16,4 +16,8 @@
 /.config.json.lock
 /.epost-cli/
 /epost-cli-data/
+paperless-target.json
+paperless-delivery.json
+.paperless-token
+paperless-token.txt
 .DS_Store

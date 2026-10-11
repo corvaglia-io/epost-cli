@@ -23,6 +23,17 @@ const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ID_BYTES: usize = 4096;
 const MAX_CONTENT_TYPE_BYTES: usize = 256;
+const PRIVATE_STATE_NAMES: [&str; 2] = ["paperless-target.json", "paperless-delivery.json"];
+
+/// Secret-free inventory for downstream delivery. Bytes are read separately
+/// through `read_saved`, which verifies the recorded size, digest and format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedDocument {
+    pub letter_id: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub media_kind: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SaveResult {
@@ -100,6 +111,7 @@ pub struct Store {
     _lock: File,
     manifest: Manifest,
     manifest_sha256: Option<String>,
+    private_state_sha256: BTreeMap<String, Option<String>>,
 }
 
 impl Store {
@@ -115,6 +127,11 @@ impl Store {
         let data_dir = namespace_dir.child("data")?;
         let raw = namespace_dir.read_optional(MANIFEST_NAME, MAX_MANIFEST_BYTES)?;
         let manifest_sha256 = raw.as_deref().map(hash);
+        let mut private_state_sha256 = BTreeMap::new();
+        for name in PRIVATE_STATE_NAMES {
+            let state = namespace_dir.read_optional(name, MAX_MANIFEST_BYTES)?;
+            private_state_sha256.insert(name.to_owned(), state.as_deref().map(hash));
+        }
         let manifest = match raw {
             Some(raw) => serde_json::from_slice::<Manifest>(&raw)
                 .map_err(|_| Error::Storage("manifest is corrupt"))?,
@@ -132,6 +149,7 @@ impl Store {
             _lock: lock,
             manifest,
             manifest_sha256,
+            private_state_sha256,
         };
         store.validate_manifest(namespace)?;
         Ok(store)
@@ -146,6 +164,138 @@ impl Store {
         self.check_manifest_unchanged()?;
         let key = document_key(&self.manifest.namespace_hash, letter_id);
         Ok(self.manifest.entries.contains_key(&key))
+    }
+
+    /// Stable hash of the exact ePost origin/mailbox namespace.
+    pub fn identity_hash(&self) -> &str {
+        &self.manifest.namespace_hash
+    }
+
+    pub fn saved_documents(&self) -> Result<Vec<SavedDocument>> {
+        self.check_directories()?;
+        self.check_manifest_unchanged()?;
+        Ok(self
+            .manifest
+            .entries
+            .values()
+            .map(|record| SavedDocument {
+                letter_id: record.letter_id.clone(),
+                sha256: record.sha256.clone(),
+                bytes: record.bytes,
+                media_kind: record.kind.name().to_owned(),
+            })
+            .collect())
+    }
+
+    pub fn read_saved(&self, letter_id: &str) -> Result<Vec<u8>> {
+        validate_identifier(letter_id)?;
+        self.check_directories()?;
+        self.check_manifest_unchanged()?;
+        let key = document_key(&self.manifest.namespace_hash, letter_id);
+        let record = self
+            .manifest
+            .entries
+            .get(&key)
+            .ok_or(Error::Storage("saved document is missing"))?;
+        let name = record
+            .path
+            .strip_prefix("data/")
+            .ok_or(Error::Storage("manifest document path is invalid"))?;
+        let bytes = self
+            .data_dir
+            .read_optional(name, MAX_CONTENT_BYTES)?
+            .ok_or(Error::Storage("saved document is missing"))?;
+        if bytes.len() as u64 != record.bytes
+            || hash(&bytes) != record.sha256
+            || classify(&bytes, record.content_type.as_deref())? != record.kind
+        {
+            return Err(Error::Storage("saved document is corrupt"));
+        }
+        Ok(bytes)
+    }
+
+    /// Access only the two fixed, secret-free Paperless state files. The store
+    /// lock, pinned directories and original byte digest guard repeat writes.
+    pub fn read_private_state(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.check_directories()?;
+        self.check_manifest_unchanged()?;
+        self.check_private_state_unchanged(name)
+    }
+
+    pub fn write_private_state(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.write_private_state_with_effect(name, bytes, || Ok(()), |_| Ok(()))
+    }
+
+    /// Commit private state with a reversible external credential change.
+    /// The store lock remains held throughout. Rollback runs only before the
+    /// atomic replacement succeeds; later fsync/readback errors retain the
+    /// effect because the new configuration has already become current.
+    pub fn write_private_state_with_effect<T>(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        effect: impl FnOnce() -> Result<T>,
+        rollback: impl FnOnce(T) -> Result<()>,
+    ) -> Result<()> {
+        if bytes.is_empty() || bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(Error::Storage(
+                "private state is empty or exceeds its size limit",
+            ));
+        }
+        self.check_directories()?;
+        self.check_manifest_unchanged()?;
+        let previous = self.check_private_state_unchanged(name)?;
+        let temp = self.namespace_dir.write_temp(bytes)?;
+        self.check_directories()?;
+        self.check_manifest_unchanged()?;
+        self.check_private_state_unchanged(name)?;
+        let undo = effect()?;
+        let commit = (|| {
+            self.check_directories()?;
+            self.check_manifest_unchanged()?;
+            self.check_private_state_unchanged(name)?;
+            let target = self.namespace_dir.path.join(name);
+            if previous.is_some() {
+                temp.persist(target)
+                    .map_err(|error| Error::Io(error.error))?;
+            } else {
+                temp.persist_noclobber(target)
+                    .map_err(|error| Error::Io(error.error))?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = commit {
+            rollback(undo).map_err(|_| Error::Storage(
+                "private state commit and external rollback failed; repair the credential store"))?;
+            return Err(error);
+        }
+        // Update the pinned byte digest immediately after committing. Even a
+        // later durability failure must not describe the previous state as
+        // still current or roll back a matching external credential.
+        self.private_state_sha256
+            .insert(name.to_owned(), Some(hash(bytes)));
+        self.namespace_dir.sync()?;
+        self.check_directories()?;
+        let persisted = self
+            .namespace_dir
+            .read_optional(name, MAX_MANIFEST_BYTES)?
+            .ok_or(Error::Storage("private state disappeared during save"))?;
+        if persisted != bytes {
+            return Err(Error::Storage("private state changed during save"));
+        }
+        Ok(())
+    }
+
+    fn check_private_state_unchanged(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let expected = self
+            .private_state_sha256
+            .get(name)
+            .ok_or(Error::Storage("private state filename is not allowed"))?;
+        let raw = self.namespace_dir.read_optional(name, MAX_MANIFEST_BYTES)?;
+        if &raw.as_deref().map(hash) != expected {
+            return Err(Error::Storage("private state changed while store was open"));
+        }
+        Ok(raw)
     }
 
     /// Verifies the saved bytes before adding a new inbox/archive source.
