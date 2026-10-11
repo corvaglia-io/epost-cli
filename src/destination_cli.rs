@@ -643,6 +643,7 @@ pub(super) async fn run(cli: &Cli, command: &DestinationCommand) -> Result<(Valu
                 },
                 cli.mock_url.is_some(),
             )?;
+            let credential_binding = new_paperless_binding(&store, &name, &url)?;
             configure_paperless(
                 cli,
                 &root,
@@ -650,7 +651,7 @@ pub(super) async fn run(cli: &Cli, command: &DestinationCommand) -> Result<(Valu
                 &mut ui,
                 Destination {
                     name,
-                    credential_binding: CredentialBinding::Named,
+                    credential_binding,
                     kind: DestinationKind::Paperless(PaperlessDestination::from(
                         epost_cli::delivery::PaperlessTarget {
                             schema_version: 1,
@@ -676,6 +677,19 @@ pub(super) async fn run(cli: &Cli, command: &DestinationCommand) -> Result<(Valu
             configure_paperless(cli, &root, &mut store, &mut ui, existing, true).await
         }
     }
+}
+
+fn new_paperless_binding(store: &Store, name: &str, url: &str) -> Result<CredentialBinding> {
+    if name == "paperless" && store.read_private_state("paperless-target.json")?.is_some() {
+        let legacy = epost_cli::delivery::load_target(store)?;
+        if legacy.url != url {
+            return Err(Error::Config(
+                "this name retains the previous Paperless instance; choose a new destination name for another URL",
+            ));
+        }
+        return Ok(CredentialBinding::Legacy);
+    }
+    Ok(CredentialBinding::Named)
 }
 
 fn setup_token(
@@ -720,6 +734,7 @@ async fn configure_paperless(
     mut destination: Destination,
     editing: bool,
 ) -> Result<(Value, u8)> {
+    epost_cli::delivery::validate_destination_ledger(store, &destination)?;
     let secret = if editing && !ui.yes("Replace the current token?", false)? {
         token(cli, root, store, &destination)?
     } else {
@@ -789,4 +804,55 @@ pub(super) fn summary(report: &Value) -> Vec<String> {
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn readding_a_removed_legacy_destination_restores_its_binding_and_rejects_rebinding() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut store = Store::open(&root, "synthetic-cli-restore-namespace").unwrap();
+        let target = epost_cli::delivery::PaperlessTarget {
+            schema_version: 1,
+            url: "https://paperless.example.invalid/".into(),
+            inbox_tag_id: 42,
+            source_tag_id: Some(43),
+            remember_token: false,
+        };
+        epost_cli::delivery::save_target(&mut store, &target).unwrap();
+        let backup = Destination {
+            name: "backup".into(),
+            credential_binding: CredentialBinding::Named,
+            kind: DestinationKind::Folder {
+                path: root.join("copies"),
+            },
+        };
+        destinations::save(&mut store, &backup).unwrap();
+        destinations::remove(&mut store, "paperless").unwrap();
+        assert_eq!(
+            new_paperless_binding(&store, "paperless", &target.url).unwrap(),
+            CredentialBinding::Legacy
+        );
+        assert!(
+            new_paperless_binding(&store, "paperless", "https://another.example.invalid").is_err()
+        );
+        let restored = Destination {
+            name: "paperless".into(),
+            credential_binding: new_paperless_binding(&store, "paperless", &target.url).unwrap(),
+            kind: DestinationKind::Paperless(target.into()),
+        };
+        destinations::save(&mut store, &restored).unwrap();
+        assert_eq!(
+            destinations::load(&store, "paperless")
+                .unwrap()
+                .credential_binding,
+            CredentialBinding::Legacy
+        );
+        assert_eq!(
+            new_paperless_binding(&store, "new", "https://another.example.invalid").unwrap(),
+            CredentialBinding::Named
+        );
+    }
 }
