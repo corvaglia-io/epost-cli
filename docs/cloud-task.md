@@ -18,7 +18,7 @@ Only supporting authentication, inbox retrieval and archive retrieval are in sco
 6. Safe output paths, atomic writes, hashes and a local manifest that supports repeat runs, distinguishes inbox/archive sources and detects existing corrupt files. Avoid file overwrites and cross-tenant collisions. Handle crashes, bounded concurrency and conflicting concurrent runs.
 7. Bounded timeouts and retries, token refresh with rotated refresh tokens, rate-limit handling, no uncontrolled redirects and no credential leakage across hosts. Fail with useful redacted diagnostics.
 8. Human-readable help plus documented structured JSON output. Define stable nonzero exit codes for authentication failure and partial retrieval so an automation engine can alert instead of recording silent success.
-9. Runtime credential input must avoid command-line password arguments and logging secrets. No default persistent token/password storage. Document how users can supply runtime credentials separately from project tests.
+9. Runtime credential input must avoid command-line password arguments and logging secrets. No default persistent token/password storage. The maintainer subsequently requested remembered login: profiles may save the username and password-source preference; password storage requires explicit opt-in and uses only the native, local, nonsynchronized macOS Keychain. Keep passwords/tokens out of profile JSON and tokens out of persistent storage. Test login/storage behavior using fake stores only, never the host Keychain. Document how users can supply runtime credentials separately from project tests.
 
 ## Tests and public CI
 

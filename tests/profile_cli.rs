@@ -36,6 +36,7 @@ fn profile(folder: &Path, kind: MailboxKind, scope: SyncScope) -> Profile {
         environment: Environment::Production,
         output: folder.join("documents"),
         scope,
+        login: None,
     }
 }
 
@@ -313,5 +314,107 @@ async fn guided_commands_require_a_terminal_and_reject_script_options_before_net
         }
     }
     assert!(!config.exists());
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remembered_username_authenticates_without_an_email_environment_variable() {
+    for login_method in [
+        config::LoginMethod::Prompt,
+        config::LoginMethod::MacosKeychain,
+    ] {
+        let server = MockServer::start().await;
+        let temp = scratch();
+        let config_path = temp.path().join("config.json");
+        let mut saved = profile(temp.path(), MailboxKind::Private, SyncScope::Inbox);
+        saved.login = Some(config::Login {
+            username: "synthetic-remembered@example.invalid".into(),
+            method: login_method,
+        });
+        config::save_profile(&config_path, "personal", &saved).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/core/latest/tenants"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!([{ "tenant_id": "synthetic-profile-tenant", "company_id": 42 }]),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST")).and(path("/core/latest/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "access_token": TOKEN, "refresh_token": "synthetic-profile-refresh", "token_type": "bearer", "expires_in": 3600 })))
+            .expect(1).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/epost/v2/letters"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let output = base(&server, &config_path)
+            .env("EPOST_PASSWORD", "synthetic-profile-password")
+            .args(["--json", "--profile", "personal", "sync"])
+            .output()
+            .unwrap();
+        report(&output, 0);
+        for request in server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+        {
+            let body = String::from_utf8_lossy(&request.body);
+            assert!(body.contains("synthetic-remembered%40example.invalid"));
+            assert!(body.contains("synthetic-profile-password"));
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn synthetic_transports_cannot_access_native_saved_passwords_or_delete_them() {
+    let server = MockServer::start().await;
+    let temp = scratch();
+    let config_path = temp.path().join("config.json");
+    let mut saved = profile(temp.path(), MailboxKind::Private, SyncScope::Inbox);
+    saved.login = Some(config::Login {
+        username: "synthetic-keychain@example.invalid".into(),
+        method: config::LoginMethod::MacosKeychain,
+    });
+    config::save_profile(&config_path, "personal", &saved).unwrap();
+    let before = fs::read(&config_path).unwrap();
+    for command in ["sync", "logout"] {
+        let output = base(&server, &config_path)
+            .args(["--json", "--profile", "personal", command])
+            .output()
+            .unwrap();
+        failure(&output);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("cannot access the native Keychain")
+        );
+    }
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn username_only_logout_needs_no_credentials_and_keeps_profile_settings() {
+    let server = MockServer::start().await;
+    let temp = scratch();
+    let config_path = temp.path().join("config.json");
+    let mut saved = profile(temp.path(), MailboxKind::Private, SyncScope::Inbox);
+    saved.login = Some(config::Login {
+        username: "synthetic-forget@example.invalid".into(),
+        method: config::LoginMethod::Prompt,
+    });
+    config::save_profile(&config_path, "personal", &saved).unwrap();
+    let output = base(&server, &config_path)
+        .args(["--json", "--profile", "personal", "logout"])
+        .output()
+        .unwrap();
+    let value = report(&output, 0);
+    assert_eq!(value["data"]["login_method"], "prompt");
+    assert_eq!(
+        config::load_profile(&config_path, "personal").unwrap(),
+        saved
+    );
     assert!(server.received_requests().await.unwrap().is_empty());
 }

@@ -1,6 +1,10 @@
 use super::*;
 use crate::interactive::{Prompts, safe_line};
-use std::{collections::VecDeque, fs};
+use std::{
+    cell::{Cell, RefCell},
+    collections::{HashMap, VecDeque},
+    fs,
+};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -13,6 +17,11 @@ struct Answers {
     inputs: VecDeque<String>,
     credential_calls: usize,
     displayed: Vec<String>,
+    keychain_supported: bool,
+    passwords_saved: usize,
+    passwords_forgotten: usize,
+    fail_password_save: bool,
+    store: FakeStore,
 }
 
 impl Answers {
@@ -21,6 +30,11 @@ impl Answers {
             inputs: inputs.iter().map(|answer| (*answer).to_owned()).collect(),
             credential_calls: 0,
             displayed: Vec::new(),
+            keychain_supported: false,
+            passwords_saved: 0,
+            passwords_forgotten: 0,
+            fail_password_save: false,
+            store: FakeStore::default(),
         }
     }
 
@@ -47,6 +61,70 @@ impl Prompts for Answers {
 
     fn line(&mut self, text: &str) -> Result<()> {
         self.displayed.push(text.to_owned());
+        Ok(())
+    }
+
+    fn supports_keychain(&self) -> bool {
+        self.keychain_supported
+    }
+    fn persist_profile(
+        &mut self,
+        cli: &Cli,
+        name: &str,
+        profile: &Profile,
+        previous: Option<&Profile>,
+        secret: Option<&Secret>,
+    ) -> Result<()> {
+        if let Some(secret) = secret {
+            assert_eq!(profile.login.as_ref().unwrap().username, EMAIL);
+            assert_eq!(secret.expose(), PASSWORD);
+        }
+        self.store.fail_set.set(self.fail_password_save);
+        credentials::save_profile_login(
+            &self.store,
+            &config::path(cli.config.as_deref())?,
+            name,
+            profile,
+            previous,
+            secret,
+        )?;
+        self.passwords_saved += usize::from(uses_keychain(profile));
+        self.passwords_forgotten +=
+            usize::from(previous.is_some_and(uses_keychain) && !uses_keychain(profile));
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct FakeStore {
+    values: RefCell<HashMap<(String, String), Secret>>,
+    fail_set: Cell<bool>,
+}
+impl keychain::CredentialStore for FakeStore {
+    fn get(&self, service: &str, account: &str) -> Result<Secret> {
+        self.get_optional(service, account)?
+            .ok_or(Error::Config("synthetic missing password"))
+    }
+    fn get_optional(&self, service: &str, account: &str) -> Result<Option<Secret>> {
+        Ok(self
+            .values
+            .borrow()
+            .get(&(service.to_owned(), account.to_owned()))
+            .cloned())
+    }
+    fn set(&self, service: &str, account: &str, secret: &Secret) -> Result<()> {
+        if self.fail_set.get() {
+            return Err(Error::Config("synthetic Keychain write failure"));
+        }
+        self.values
+            .borrow_mut()
+            .insert((service.to_owned(), account.to_owned()), secret.clone());
+        Ok(())
+    }
+    fn delete(&self, service: &str, account: &str) -> Result<()> {
+        self.values
+            .borrow_mut()
+            .remove(&(service.to_owned(), account.to_owned()));
         Ok(())
     }
 }
@@ -87,6 +165,7 @@ fn saved_profile(directory: &Path) {
             environment: Environment::Production,
             output: directory.join("documents"),
             scope: Scope::Inbox,
+            login: None,
         },
     )
     .unwrap();
@@ -198,7 +277,9 @@ async fn setup_retries_kind_and_tenant_choices_then_saves_only_selected_settings
     assert_eq!(saved.output, documents);
     assert_eq!(saved.scope, Scope::Both);
     let raw = fs::read_to_string(temp.path().join("config.json")).unwrap();
-    for secret in [EMAIL, PASSWORD, TOKEN, "synthetic-guided-refresh"] {
+    assert_eq!(saved.login.as_ref().unwrap().username, EMAIL);
+    assert_eq!(saved.login.as_ref().unwrap().method, LoginMethod::Prompt);
+    for secret in [PASSWORD, TOKEN, "synthetic-guided-refresh"] {
         assert!(!raw.contains(secret));
     }
     let requests = server.received_requests().await.unwrap();
@@ -604,4 +685,188 @@ fn provider_display_strings_cannot_emit_terminal_controls_or_hide_text_direction
     let long = safe_line(&"é".repeat(121));
     assert_eq!(long.chars().count(), 121);
     assert!(long.ends_with('…'));
+}
+
+#[tokio::test]
+async fn setup_keychain_choice_requires_affirmative_opt_in_and_retries_bad_answers() {
+    for (answer, expected) in [
+        ("yes", LoginMethod::MacosKeychain),
+        ("", LoginMethod::Prompt),
+        ("no", LoginMethod::Prompt),
+    ] {
+        let server = MockServer::start().await;
+        let temp = scratch();
+        standard_auth(&server).await;
+        let documents = temp.path().join("documents");
+        let selected = cli(
+            &server,
+            temp.path(),
+            &[
+                "setup",
+                "--output",
+                documents.to_str().unwrap(),
+                "--scope",
+                "inbox",
+            ],
+        );
+        let mut answers = Answers::new(&["private", "1", "maybe", answer]);
+        answers.keychain_supported = true;
+        assert_eq!(interactive::run(&selected, &mut answers).await.unwrap(), 0);
+        let saved = config::load_profile(&temp.path().join("config.json"), "personal").unwrap();
+        assert_eq!(saved.login.as_ref().unwrap().method, expected);
+        assert_eq!(
+            answers.passwords_saved,
+            usize::from(expected == LoginMethod::MacosKeychain)
+        );
+        assert!(answers.inputs.is_empty());
+        assert!(
+            answers
+                .text()
+                .contains("Passwords and session tokens are absent")
+        );
+        answers.assert_safe();
+    }
+}
+
+#[tokio::test]
+async fn failed_keychain_storage_keeps_a_usable_username_only_profile() {
+    let server = MockServer::start().await;
+    let temp = scratch();
+    standard_auth(&server).await;
+    let documents = temp.path().join("documents");
+    let selected = cli(
+        &server,
+        temp.path(),
+        &[
+            "setup",
+            "--output",
+            documents.to_str().unwrap(),
+            "--scope",
+            "inbox",
+        ],
+    );
+    let mut answers = Answers::new(&["private", "1", "yes"]);
+    answers.keychain_supported = true;
+    answers.fail_password_save = true;
+    assert!(interactive::run(&selected, &mut answers).await.is_err());
+    let saved = config::load_profile(&temp.path().join("config.json"), "personal").unwrap();
+    assert_eq!(saved.login.as_ref().unwrap().method, LoginMethod::Prompt);
+    assert_eq!(saved.login.as_ref().unwrap().username, EMAIL);
+    assert!(
+        !fs::read_to_string(temp.path().join("config.json"))
+            .unwrap()
+            .contains(PASSWORD)
+    );
+    answers.assert_safe();
+}
+
+#[tokio::test]
+async fn login_updates_old_profile_without_repeating_mailbox_or_destination_setup() {
+    for remember in [false, true] {
+        let server = MockServer::start().await;
+        let temp = scratch();
+        standard_auth(&server).await;
+        saved_profile(temp.path());
+        let arguments = if remember {
+            vec!["--profile", "personal", "login", "--remember"]
+        } else {
+            vec!["--profile", "personal", "login"]
+        };
+        let mut selected = cli(&server, temp.path(), &arguments);
+        load_profile(&mut selected).unwrap();
+        let previous = selected.selected_profile.clone().unwrap();
+        let mut answers = Answers::new(&[]);
+        answers.keychain_supported = true;
+        assert_eq!(interactive::run(&selected, &mut answers).await.unwrap(), 0);
+        assert_eq!(answers.credential_calls, 1);
+        assert_eq!(answers.passwords_saved, usize::from(remember));
+        let saved = config::load_profile(&temp.path().join("config.json"), "personal").unwrap();
+        assert_eq!(saved.mailbox, previous.mailbox);
+        assert_eq!(saved.output, previous.output);
+        assert_eq!(saved.scope, previous.scope);
+        assert_eq!(saved.login.as_ref().unwrap().username, EMAIL);
+        assert_eq!(
+            saved.login.as_ref().unwrap().method,
+            if remember {
+                LoginMethod::MacosKeychain
+            } else {
+                LoginMethod::Prompt
+            }
+        );
+        assert!(!answers.text().contains("Mailbox number:"));
+        answers.assert_safe();
+    }
+}
+
+#[tokio::test]
+async fn unsupported_remember_fails_before_sign_in_and_synthetic_native_access_is_blocked() {
+    let server = MockServer::start().await;
+    let temp = scratch();
+    saved_profile(temp.path());
+    let mut selected = cli(
+        &server,
+        temp.path(),
+        &["--profile", "personal", "login", "--remember"],
+    );
+    load_profile(&mut selected).unwrap();
+    let mut answers = Answers::new(&[]);
+    assert!(interactive::run(&selected, &mut answers).await.is_err());
+    assert_eq!(answers.credential_calls, 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(native_keychain_allowed(&selected).is_err());
+}
+
+#[test]
+fn progress_attention_does_not_echo_arbitrary_provider_text() {
+    let marker = "synthetic-private-title-secret";
+    let report = json!({"pagination_complete": false, "documents": [{"status":"failed", "letter_id":marker, "error":marker}], "issues":[marker], "inventories":[]});
+    assert!(!attention_lines(&report).join("\n").contains(marker));
+    assert!(
+        attention_lines(&report)
+            .join("\n")
+            .contains("Inventory is incomplete")
+    );
+}
+
+#[tokio::test]
+async fn profile_login_with_empty_discovery_is_an_error_and_keeps_existing_settings() {
+    let server = MockServer::start().await;
+    let temp = scratch();
+    saved_profile(temp.path());
+    auth(&server, json!([]), 0).await;
+    let mut selected = cli(&server, temp.path(), &["--profile", "personal", "login"]);
+    load_profile(&mut selected).unwrap();
+    let before = fs::read(temp.path().join("config.json")).unwrap();
+    let mut answers = Answers::new(&[]);
+    assert!(interactive::run(&selected, &mut answers).await.is_err());
+    assert_eq!(fs::read(temp.path().join("config.json")).unwrap(), before);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn username_only_login_can_convert_a_copied_mac_profile_without_os_storage() {
+    let temp = scratch();
+    saved_profile(temp.path());
+    let path = temp.path().join("config.json");
+    let mut previous = config::load_profile(&path, "personal").unwrap();
+    previous.login = Some(Login {
+        username: EMAIL.into(),
+        method: LoginMethod::MacosKeychain,
+    });
+    config::save_profile(&path, "personal", &previous).unwrap();
+    let mut selected = Cli::try_parse_from([
+        "epost-cli",
+        "--config",
+        path.to_str().unwrap(),
+        "--profile",
+        "personal",
+        "login",
+    ])
+    .unwrap();
+    load_profile(&mut selected).unwrap();
+    let mut next = previous.clone();
+    next.login.as_mut().unwrap().method = LoginMethod::Prompt;
+    persist_profile(&selected, "personal", &next, Some(&previous), None).unwrap();
+    assert_eq!(config::load_profile(&path, "personal").unwrap(), next);
 }

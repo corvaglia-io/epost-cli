@@ -36,6 +36,17 @@ pub struct Inventory {
     pub failure_exit_code: Option<u8>,
 }
 
+/// Progress for an attempted page, without any provider or account metadata.
+///
+/// Pages are one-based. `documents` is the cumulative number of retained
+/// entries: usable IDs are deduplicated, and entries missing an ID are retained
+/// so callers can report incomplete inventory rather than discard metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageProgress {
+    Started { page: u32, documents: usize },
+    Completed { page: u32, documents: usize },
+}
+
 pub async fn page(
     client: &mut ApiClient,
     source: &Source,
@@ -56,6 +67,19 @@ pub async fn collect(
     size: u32,
     max_pages: u32,
 ) -> Result<Inventory> {
+    collect_with_progress(client, source, size, max_pages, |_| {}).await
+}
+
+/// The same bounded traversal as [`collect`], with an observer around each
+/// attempted request. A failed request still emits `Completed`; it does not
+/// count as a successfully retrieved page in the resulting inventory.
+pub async fn collect_with_progress(
+    client: &mut ApiClient,
+    source: Source,
+    size: u32,
+    max_pages: u32,
+    mut observer: impl FnMut(PageProgress),
+) -> Result<Inventory> {
     if !(1..=1000).contains(&size) || !(1..=100_000).contains(&max_pages) {
         return Err(Error::Config(
             "page size must be 1..1000 and max pages 1..100000",
@@ -72,10 +96,21 @@ pub async fn collect(
     let mut seen = HashSet::new();
     let mut offset = 0u32;
     for _ in 0..max_pages {
+        let current_page = result.pages + 1;
+        observer(PageProgress::Started {
+            page: current_page,
+            documents: result.letters.len(),
+        });
         let items = match page(client, &result.source, size, offset).await {
             Ok(items) => items,
-            Err(error) if result.pages == 0 => return Err(error),
             Err(error) => {
+                observer(PageProgress::Completed {
+                    page: current_page,
+                    documents: result.letters.len(),
+                });
+                if result.pages == 0 {
+                    return Err(error);
+                }
                 result.failure_exit_code = Some(error.exit_code());
                 result.issues.push(error.to_string());
                 return Ok(result);
@@ -87,6 +122,10 @@ pub async fn collect(
             result
                 .issues
                 .push("provider returned more entries than requested".into());
+            observer(PageProgress::Completed {
+                page: current_page,
+                documents: result.letters.len(),
+            });
             return Ok(result);
         }
         let mut new_count = 0;
@@ -95,6 +134,10 @@ pub async fn collect(
                 result
                     .issues
                     .push("inventory letter safety limit reached".into());
+                observer(PageProgress::Completed {
+                    page: current_page,
+                    documents: result.letters.len(),
+                });
                 return Ok(result);
             }
             match letter.id.as_deref().filter(|id| !id.is_empty()) {
@@ -119,6 +162,10 @@ pub async fn collect(
                 }
             }
         }
+        observer(PageProgress::Completed {
+            page: current_page,
+            documents: result.letters.len(),
+        });
         if count < size as usize {
             result.pagination_complete = result.issues.is_empty();
             return Ok(result);

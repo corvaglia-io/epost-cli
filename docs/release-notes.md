@@ -2,8 +2,10 @@ Development release of the unofficial epost-cli Rust CLI and library.
 
 - Guided setup with retrying prompts and explicit numbered mailbox selection.
 - Readable inbox/archive browsing and numbered downloads with one sign-in per session.
-- Private, credential-free profiles for short download/sync commands.
+- Private profiles for short download/sync commands, with remembered usernames and explicit macOS Keychain password opt-in.
 - Repeat syncs verify saved files and fetch only unsaved content.
+- Live terminal sync progress and readable summaries of saved, reused and incomplete retrieval, with JSON reports retained for automation.
+- Profile login updates and local password forgetting without repeating mailbox setup.
 
 - Read-only inbox and archive metadata/document retrieval.
 - Explicit private/business mailbox selection, password/bearer authentication and business API keys.

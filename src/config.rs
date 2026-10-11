@@ -28,7 +28,23 @@ pub enum SyncScope {
     Both,
 }
 
-/// Reusable settings only; credentials and account emails are never persisted.
+/// How a runtime login obtains the password; secret values are never stored here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginMethod {
+    Prompt,
+    MacosKeychain,
+}
+
+/// Optional remembered account name and password source, without a password.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Login {
+    pub username: String,
+    pub method: LoginMethod,
+}
+
+/// Reusable mailbox settings and optional account name; no passwords or tokens.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -37,6 +53,8 @@ pub struct Profile {
     pub environment: Environment,
     pub output: PathBuf,
     pub scope: SyncScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<Login>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -116,7 +134,7 @@ pub fn profile_exists(path: &Path, name: &str) -> Result<bool> {
 
 /// Preserve every existing profile; never overwrite corrupt configuration.
 pub fn save_profile(path: &Path, name: &str, profile: &Profile) -> Result<()> {
-    save_inner(path, name, profile, None)
+    save_inner(path, name, profile, None, || Ok(()), |_| Ok(()))
 }
 
 /// Save only if the target still matches the profile the caller reviewed.
@@ -129,14 +147,37 @@ pub fn save_profile_if_unchanged(
     profile: &Profile,
     expected: Option<&Profile>,
 ) -> Result<()> {
-    save_inner(path, name, profile, Some(expected))
+    save_profile_with_effect(path, name, profile, expected, || Ok(()), |_| Ok(()))
 }
 
-fn save_inner(
+/// Compare and save a profile together with a reversible external change.
+///
+/// The writer lock is held while checking `expected`, preparing the private,
+/// synced replacement file, applying `effect`, and committing configuration.
+/// `None` requires that the target profile is absent. `effect` returns the state
+/// needed to undo its change; if it fails, it must undo any partial change itself.
+/// A failure before atomic replacement invokes `rollback` while still locked.
+/// After replacement succeeds, later durability/readback failures do not undo
+/// the effect because the new configuration is already current. Callbacks must
+/// not write this configuration or recursively invoke a profile save.
+pub fn save_profile_with_effect<T>(
+    path: &Path,
+    name: &str,
+    profile: &Profile,
+    expected: Option<&Profile>,
+    effect: impl FnOnce() -> Result<T>,
+    rollback: impl FnOnce(T) -> Result<()>,
+) -> Result<()> {
+    save_inner(path, name, profile, Some(expected), effect, rollback)
+}
+
+fn save_inner<T>(
     path: &Path,
     name: &str,
     profile: &Profile,
     expected: Option<Option<&Profile>>,
+    effect: impl FnOnce() -> Result<T>,
+    rollback: impl FnOnce(T) -> Result<()>,
 ) -> Result<()> {
     validate_name(name)?;
     validate_profile(profile)?;
@@ -178,9 +219,18 @@ fn save_inner(
     if directory.read_optional(filename)? != previous {
         return Err(Error::Config("configuration changed while saving; retry"));
     }
-    temporary
-        .persist(directory.path.join(filename))
-        .map_err(|_| Error::Config("configuration could not be saved atomically"))?;
+    let undo = effect()?;
+    let commit = (|| {
+        directory.validate()?;
+        temporary
+            .persist(directory.path.join(filename))
+            .map_err(|_| Error::Config("configuration could not be saved atomically"))?;
+        Ok(())
+    })();
+    if let Err(error) = commit {
+        rollback(undo).map_err(|_| Error::Config("configuration could not be saved and rollback failed; repair the external credential store and run setup again before using this profile"))?;
+        return Err(error);
+    }
     directory.sync()?;
     directory.validate()?;
     if directory.read_optional(filename)?.as_deref() != Some(raw.as_slice()) {
@@ -225,6 +275,13 @@ fn validate_profile(profile: &Profile) -> Result<()> {
         || profile.mailbox.company_id < 0
     {
         return Err(Error::Config("profile mailbox identity is invalid"));
+    }
+    if profile.login.as_ref().is_some_and(|login| {
+        login.username.trim().is_empty()
+            || login.username.len() > 4096
+            || login.username.chars().any(char::is_control)
+    }) {
+        return Err(Error::Config("profile login username is invalid"));
     }
     validate_absolute(&profile.output)
 }

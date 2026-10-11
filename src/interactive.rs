@@ -7,6 +7,29 @@ pub(crate) trait Prompts {
     fn input(&mut self, prompt: &str) -> Result<Option<String>>;
     fn credentials(&mut self, cli: &Cli) -> Result<(String, Secret)>;
     fn line(&mut self, text: &str) -> Result<()>;
+    fn supports_keychain(&self) -> bool {
+        false
+    }
+    fn persist_profile(
+        &mut self,
+        cli: &Cli,
+        name: &str,
+        profile: &Profile,
+        previous: Option<&Profile>,
+        _secret: Option<&Secret>,
+    ) -> Result<()> {
+        if uses_keychain(profile) || previous.is_some_and(uses_keychain) {
+            return Err(Error::Config(
+                "this frontend does not support password storage",
+            ));
+        }
+        config::save_profile_if_unchanged(
+            &config::path(cli.config.as_deref())?,
+            name,
+            profile,
+            previous,
+        )
+    }
 }
 
 pub(crate) struct Terminal;
@@ -57,6 +80,20 @@ impl Prompts for Terminal {
     fn line(&mut self, text: &str) -> Result<()> {
         writeln!(io::stderr().lock(), "{text}")?;
         Ok(())
+    }
+
+    fn supports_keychain(&self) -> bool {
+        keychain::supported()
+    }
+    fn persist_profile(
+        &mut self,
+        cli: &Cli,
+        name: &str,
+        profile: &Profile,
+        previous: Option<&Profile>,
+        secret: Option<&Secret>,
+    ) -> Result<()> {
+        persist_profile(cli, name, profile, previous, secret)
     }
 }
 
@@ -172,7 +209,10 @@ fn valid_destination(path: &Path) -> bool {
         })
 }
 
-async fn sign_in(cli: &Cli, prompts: &mut impl Prompts) -> Result<Option<(ApiClient, Mailbox)>> {
+async fn sign_in(
+    cli: &Cli,
+    prompts: &mut impl Prompts,
+) -> Result<Option<(ApiClient, Mailbox, String, Secret)>> {
     if cli.tenant_kind.is_some() || cli.tenant_id.is_some() || cli.company_id.is_some() {
         return Err(Error::Config(
             "guided commands select the mailbox; use a profile or the numbered choices",
@@ -185,6 +225,11 @@ async fn sign_in(cli: &Cli, prompts: &mut impl Prompts) -> Result<Option<(ApiCli
     let mut discovery = client(cli, None)?;
     let tenants = discovery.tenants_password(&username, &secret).await?;
     if tenants.is_empty() {
+        if cli.selected_profile.is_some() {
+            return Err(Error::Config(
+                "profile mailbox is not in this account; run setup again",
+            ));
+        }
         prompts.line("No accessible mailboxes were returned for this account.")?;
         return Ok(None);
     }
@@ -233,10 +278,8 @@ async fn sign_in(cli: &Cli, prompts: &mut impl Prompts) -> Result<Option<(ApiCli
     };
     let mut selected = client(cli, Some(mailbox.clone()))?;
     selected.login(&username, &secret).await?;
-    // Drop credentials after the single login; this client owns the scoped session.
-    drop(secret);
     prompts.line("Signed in. The session ends when you quit.")?;
-    Ok(Some((selected, mailbox)))
+    Ok(Some((selected, mailbox, username, secret)))
 }
 
 pub(crate) async fn run(cli: &Cli, prompts: &mut impl Prompts) -> Result<u8> {
@@ -258,7 +301,12 @@ pub(crate) async fn run(cli: &Cli, prompts: &mut impl Prompts) -> Result<u8> {
         let path = config::path(cli.config.as_deref())?;
         config::profile_exists(&path, cli.profile.as_deref().unwrap_or("personal"))?;
     }
-    let Some((mut client, mailbox)) = sign_in(cli, prompts).await? else {
+    if matches!(cli.command, Command::Login { remember: true }) && !prompts.supports_keychain() {
+        return Err(Error::Config(
+            "--remember requires macOS Keychain; omit it to remember only the username",
+        ));
+    }
+    let Some((mut client, mailbox, username, secret)) = sign_in(cli, prompts).await? else {
         return Ok(0);
     };
     match &cli.command {
@@ -305,17 +353,34 @@ pub(crate) async fn run(cli: &Cli, prompts: &mut impl Prompts) -> Result<u8> {
                     }
                 }
             }
-            config::save_profile_if_unchanged(
-                &path,
-                name,
-                &Profile {
-                    mailbox,
-                    environment: environment(cli),
-                    output,
-                    scope: selected_scope,
-                },
-                previous.as_ref(),
-            )?;
+            let mut profile = Profile {
+                mailbox,
+                environment: environment(cli),
+                output,
+                scope: selected_scope,
+                login: Some(Login {
+                    username: username.clone(),
+                    method: LoginMethod::Prompt,
+                }),
+            };
+            prompts.persist_profile(cli, name, &profile, previous.as_ref(), None)?;
+            prompts.line("Saved: mailbox, document folder, sync scope and account email. Passwords and session tokens are absent from the configuration.")?;
+            if prompts.supports_keychain() {
+                prompts.line("Optionally save the password in this Mac's Keychain for future syncs. macOS may request access; a locked Keychain can require interaction.")?;
+                while let Some(answer) =
+                    cancelled(prompts.input("Save password in macOS Keychain? [y/N]: ")?)
+                {
+                    match answer.to_ascii_lowercase().as_str() {
+                        "yes" | "y" => {
+                            remember_login(cli, name, &mut profile, &secret, prompts)?;
+                            break;
+                        }
+                        "" | "no" | "n" => break,
+                        _ => prompts.line("Type yes or no. Please try again.")?,
+                    }
+                }
+            }
+            drop(secret);
             let config_flag = cli
                 .config
                 .as_ref()
@@ -334,13 +399,45 @@ pub(crate) async fn run(cli: &Cli, prompts: &mut impl Prompts) -> Result<u8> {
                 "Download new documents with: {}",
                 safe_text(&format!("epost-cli{config_flag} --profile={name} sync"))
             ))?;
-            prompts.line("Supply credentials by prompt or your scheduler's secret mechanism. The profile contains no credentials.")?;
+            login_message(&profile, prompts)?;
+            Ok(0)
+        }
+        Command::Login { remember } => {
+            let name = cli
+                .profile
+                .as_deref()
+                .ok_or(Error::Config("login requires --profile"))?;
+            let previous = cli
+                .selected_profile
+                .as_ref()
+                .ok_or(Error::Config("login requires a saved profile"))?;
+            let mut profile = previous.clone();
+            profile.login = Some(Login {
+                username: username.clone(),
+                method: LoginMethod::Prompt,
+            });
+            if *remember {
+                prompts.line(
+                    "Saving the password in this Mac's Keychain, as requested by --remember.",
+                )?;
+                profile.login.as_mut().unwrap().method = LoginMethod::MacosKeychain;
+            }
+            prompts.persist_profile(
+                cli,
+                name,
+                &profile,
+                Some(previous),
+                if *remember { Some(&secret) } else { None },
+            )?;
+            drop(secret);
+            login_message(&profile, prompts)?;
             Ok(0)
         }
         Command::Browse {
             output: explicit,
             page_size,
         } => {
+            drop(secret);
             let Some(output) = destination(cli, explicit.as_deref(), prompts)? else {
                 return Ok(0);
             };
@@ -425,6 +522,25 @@ pub(crate) async fn run(cli: &Cli, prompts: &mut impl Prompts) -> Result<u8> {
             }
         }
         _ => Err(Error::Config("guided session requires setup or browse")),
+    }
+}
+
+fn remember_login(
+    cli: &Cli,
+    name: &str,
+    profile: &mut Profile,
+    secret: &Secret,
+    prompts: &mut impl Prompts,
+) -> Result<()> {
+    let previous = profile.clone();
+    profile.login.as_mut().unwrap().method = LoginMethod::MacosKeychain;
+    prompts.persist_profile(cli, name, profile, Some(&previous), Some(secret))
+}
+
+fn login_message(profile: &Profile, prompts: &mut impl Prompts) -> Result<()> {
+    match profile.login.as_ref().map(|login| login.method) {
+        Some(LoginMethod::MacosKeychain) => prompts.line("Account email remembered; future commands obtain the password from macOS Keychain. No authenticated session is saved."),
+        _ => prompts.line("Account email remembered; future commands still need a password. Use profile login --remember for macOS Keychain, or your scheduler's secret mechanism."),
     }
 }
 

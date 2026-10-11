@@ -3,8 +3,11 @@
 
 pub mod api;
 pub mod config;
+pub mod credentials;
 pub mod error;
+pub mod keychain;
 pub mod models;
 pub mod pagination;
+pub mod progress;
 pub mod secret;
 pub mod storage;

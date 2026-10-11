@@ -56,7 +56,11 @@ Authentication and tenant contract [1–4]
   tenant ID, company ID and API origin; never reuse after selecting another
   tenant. Redact credentials from Debug/logging/errors. Password/token input
   belongs in a prompt, stdin or explicitly documented environment variables,
-  never command-line password arguments. Never persist the account password.
+  never command-line password arguments. Never put the password in profile JSON.
+  Default to runtime-only input; the maintainer subsequently authorized optional
+  native macOS Keychain password storage with explicit user opt-in. Entries must
+  be local, nonsynchronized and bound to the exact config/profile, account,
+  environment and mailbox identity. Persist no tokens.
 - ePost operations declare X-API-KEY OR Bearer authentication. Bearer is the
   supported baseline for private login; no private API-key entitlement is
   established here. Do not require an API key alongside a bearer token.
@@ -141,8 +145,13 @@ Suggested Rust and CLI boundaries (design choices, not provider requirements)
   archive list --root|--directory-id ID. A selected explicit profile supplies
   the tenant kind/IDs to every read command. Support stable --json output.
 - Isolate credential input behind an interface. Use memory/session/environment
-  input for v1 and test with a memory store. Persistent keyring/token storage
-  can remain parked. Keep ordinary profile configuration free of credentials.
+  input and fake stores in tests; never access host Keychain in tests or CI.
+  Profiles may remember the username and prompt/macOS-Keychain source preference,
+  but reject passwords/tokens at every JSON level. Native Mac Keychain password
+  storage is runtime-only and opt-in; it is unsupported elsewhere. Explicit
+  password stdin/environment input overrides the saved source. Local logout
+  forgets the Keychain password while retaining the username and mailbox settings;
+  it does not call a provider logout endpoint or mutate mail.
   Never print raw tokens through normal JSON output.
 - Construct content URLs from the configured API origin and encoded ID; do not
   follow arbitrary letterContentReference hosts. Disable authenticated redirects
