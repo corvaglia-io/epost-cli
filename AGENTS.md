@@ -33,4 +33,6 @@ Do not confuse archive retrieval with moving a letter into the archive.
 
 ## Delivery
 
-Work on a feature branch and produce a reviewable draft PR. Do not merge, force-push, publish packages/binaries or change repository access/settings. Preserve existing changes. License choice is pending; do not invent approval for a license.
+Work on a feature branch and produce a reviewable draft PR. Do not merge, force-push or change repository access/settings. Preserve existing changes. The maintainer selected the MIT license; preserve LICENSE and the package license declaration.
+
+Versioned release CI is authorized: build and test public CI artifacts, and let matching version tags on commits merged into main publish GitHub releases after validation. Keep build/test permissions read-only and grant release writes only to the tag-triggered publisher. Do not create/push the first release tag or publish a release interactively without a separate explicit request. Crates.io publishing remains outside scope.
