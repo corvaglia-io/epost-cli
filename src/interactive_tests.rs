@@ -715,7 +715,7 @@ async fn numbered_download_explains_unavailable_content_without_echoing_message_
     assert_eq!(interactive::run(&cli, &mut answers).await.unwrap(), 2);
     let text = answers.text();
     assert!(text.contains("Download unavailable; no content was saved."));
-    assert!(text.contains("Download needs attention: message exists in letter metadata, but downloadable content is unavailable; review it in ePost."));
+    assert!(text.contains("Download needs attention: message exists in letter metadata, but the public API cannot download content (HTTP 404); review this item in the ePost app or website."));
     assert!(!text.contains("synthetic-private-message-never-echo"));
     assert!(!text.contains("synthetic-private-body-never-echo"));
     let selected_mailbox = mailbox(&cli).unwrap();

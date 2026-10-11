@@ -255,6 +255,8 @@ struct ContentDiagnostic {
     has_file_name: bool,
     has_content_reference: bool,
     registered_pending: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_action: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -573,6 +575,7 @@ fn content_diagnostic(letter: &Letter) -> ContentDiagnostic {
             .is_some_and(|s| !s.trim().is_empty()),
         has_content_reference: present("letterContentReference"),
         registered_pending: registered_pending(letter),
+        recovery_action: None,
     }
 }
 
@@ -621,6 +624,8 @@ async fn retrieve(
                     diagnostic.metadata_http_status = Some(200);
                     if registered_pending(&current) {
                         status = "awaiting_manual_acceptance_or_status_verification";
+                    } else {
+                        diagnostic.recovery_action = Some("check_or_download_in_epost");
                     }
                 }
                 Ok(_) => {
@@ -640,12 +645,17 @@ async fn retrieve(
                     diagnostic.metadata_error = Some(error.to_string());
                 }
             }
+            let error = if diagnostic.recovery_action.is_some() {
+                epost_cli::summary::PUBLIC_API_CONTENT_UNAVAILABLE_MESSAGE.to_owned()
+            } else {
+                Error::Http(404).to_string()
+            };
             return Ok(Retrieval {
                 letter_id: Some(id.into()),
                 source: source.into(),
                 status: status.into(),
                 document: None,
-                error: Some(Error::Http(404).to_string()),
+                error: Some(error),
                 diagnostic: Some(diagnostic),
             });
         }

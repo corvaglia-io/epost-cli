@@ -7,6 +7,7 @@ Development release of the unofficial epost-cli Rust CLI and library.
 - Read-only inbox checks for unread and locally unsaved items, plus an optional conditional inbox sync and a single-request unread-only mode.
 - Live terminal sync progress and a single readable summary, including cached non-PDF content, with JSON reports retained for automation.
 - Content 404 diagnostics using one canonical read-only metadata check, and byte-derived format hints for saved and cached content.
+- Clear public-API download errors and a JSON recovery action when matching metadata remains accessible; manual ePost download guidance preserves failed status and partial exit codes. Authenticated website fallback is documented as a possible future improvement only.
 - Archive folder observations identify unsupported selectors; explicitly empty folders without subfolders are informational, with coverage still unverified.
 - Profile login updates and local password forgetting without repeating mailbox setup.
 

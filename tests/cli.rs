@@ -779,6 +779,12 @@ async fn content_404_is_diagnosed_with_one_canonical_metadata_check() {
     let cases = [
         (
             200,
+            json!({"id":"invented-unavailable", "letterType":"CLASSIC_LETTER", "fileName":"synthetic-document.pdf", "letterContentReference":"https://untrusted.invalid/must-not-follow"}),
+            "content_unavailable_metadata_available",
+            "failed",
+        ),
+        (
+            200,
             json!({"id":"invented-unavailable", "letterType":"SIMPLE_SHORT_MESSAGE", "documentMessage":"invented message", "fileName":"invented.pdf", "letterContentReference":"https://untrusted.invalid/must-not-follow"}),
             "content_unavailable_metadata_available",
             "failed",
@@ -850,6 +856,20 @@ async fn content_404_is_diagnosed_with_one_canonical_metadata_check() {
             failed["diagnostic"]["metadata_http_status"],
             metadata_status
         );
+        let manual_recovery =
+            reason == "content_unavailable_metadata_available" && status == "failed";
+        assert_eq!(
+            failed["diagnostic"]["recovery_action"].as_str(),
+            manual_recovery.then_some("check_or_download_in_epost")
+        );
+        if manual_recovery {
+            assert_eq!(
+                failed["error"],
+                "public API cannot download this item (HTTP 404), although its metadata is accessible; check or download it manually in the ePost app or website"
+            );
+        } else {
+            assert_eq!(failed["error"], "provider returned HTTP 404");
+        }
         assert_eq!(payload["data"]["documents"][1]["status"], "saved_pdf");
         assert!(!String::from_utf8_lossy(&output.stdout).contains("fake-private-body"));
         assert!(!String::from_utf8_lossy(&output.stdout).contains("untrusted.invalid"));
@@ -1084,7 +1104,68 @@ async fn direct_download_content_404_keeps_partial_status_and_diagnostics() {
     );
     assert_eq!(payload["data"]["diagnostic"]["letter_type"], "SMART_LETTER");
     assert!(payload["data"]["document"].is_null());
+    assert_eq!(
+        payload["data"]["diagnostic"]["recovery_action"],
+        "check_or_download_in_epost"
+    );
+    assert!(
+        payload["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("public API cannot download this item")
+    );
     assert_read_only(&server.received_requests().await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accessible_metadata_does_not_cache_a_failed_content_download_as_success() {
+    let server = MockServer::start().await;
+    let store = temp_store();
+    inbox(&server, json!([{"id":"invented-retryable"}])).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    Mock::given(method("GET"))
+        .and(path("/epost/v2/letters/invented-retryable/content"))
+        .respond_with(move |_: &Request| {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(404).set_body_string(FAKE_TOKEN)
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_bytes(PDF)
+                    .insert_header("content-type", "application/pdf")
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/epost/v2/letters/invented-retryable"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id":"invented-retryable", "letterType":"CLASSIC_LETTER", "fileName":"synthetic-document.pdf"
+        }))).expect(1).mount(&server).await;
+    for (exit_code, status) in [(2, "failed"), (0, "saved_pdf")] {
+        let output = selected_command(&server)
+            .args(["sync", "--scope", "inbox", "--output"])
+            .arg(store.path())
+            .output()
+            .unwrap();
+        let payload = successful_output(&output, exit_code);
+        let document = &payload["data"]["documents"][0];
+        assert_eq!(document["status"], status);
+        if status == "failed" {
+            assert_eq!(
+                document["diagnostic"]["recovery_action"],
+                "check_or_download_in_epost"
+            );
+            assert!(document["document"].is_null());
+        } else {
+            assert!(document["diagnostic"].is_null());
+            assert_eq!(document["document"]["media_kind"], "pdf");
+        }
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 5);
+    assert_read_only(&requests);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -47,7 +47,7 @@ fn unavailable_content_uses_the_verified_metadata_diagnostic() {
     ]));
     let lines = attention_lines(&report);
     for expected in [
-        "Attention (2): document metadata is available, but content returned HTTP 404; check the document in ePost.",
+        "Attention (2): public API cannot download this item (HTTP 404), although its metadata is accessible; check or download it manually in the ePost app or website.",
         "Attention (1): document metadata and content returned HTTP 404; check the document in ePost.",
         "Attention (1): content returned HTTP 404; metadata check failed, so availability is uncertain.",
         "Attention (1): content returned HTTP 404; metadata ID did not match, so availability is uncertain.",
@@ -80,7 +80,7 @@ fn short_messages_explain_metadata_without_displaying_the_message() {
         }
     ]));
     let lines = attention_lines(&report).join("\n");
-    assert!(lines.contains("Attention (1): message exists in letter metadata, but downloadable content is unavailable; review it in ePost."));
+    assert!(lines.contains("Attention (1): message exists in letter metadata, but the public API cannot download content (HTTP 404); review this item in the ePost app or website."));
     assert!(lines.contains("Unavailable content: SIMPLE_SHORT_MESSAGE (1); metadata available; messages present: 1, filenames present: 0, content references present: 0."));
     assert!(!lines.contains("synthetic-private-message"));
     assert!(!lines.contains("invented-private-message-id"));
@@ -97,7 +97,9 @@ fn missing_message_flag_does_not_claim_a_message_exists() {
             } }
         ]));
         let lines = attention_lines(&report).join("\n");
-        assert!(lines.contains("document metadata is available, but content returned HTTP 404"));
+        assert!(lines.contains(
+            "public API cannot download this item (HTTP 404), although its metadata is accessible"
+        ));
         assert!(!lines.contains("message exists in letter metadata"));
     }
 }
@@ -217,4 +219,40 @@ fn failed_numbered_download_uses_the_same_safe_reason_as_sync() {
         ]
     );
     assert!(document_attention(&json!({ "status": "saved_pdf" })).is_empty());
+}
+
+#[test]
+fn verified_api_unavailability_has_manual_guidance_without_claiming_web_success() {
+    let document = json!({
+        "status": "failed",
+        "error": "synthetic-private-provider-body",
+        "letter_id": "synthetic-private-identifier",
+        "diagnostic": {
+            "reason_code": "content_unavailable_metadata_available",
+            "content_http_status": 404,
+            "metadata_http_status": 200,
+            "recovery_action": "check_or_download_in_epost",
+        },
+    });
+    let lines = document_attention(&document).join("\n");
+    assert!(lines.contains("public API cannot download this item (HTTP 404)"));
+    assert!(lines.contains("metadata is accessible"));
+    assert!(lines.contains("check or download it manually in the ePost app or website"));
+    for forbidden in [
+        "synthetic-private",
+        "deleted",
+        "onboarding",
+        "non-scanned",
+        "web-only",
+        "will succeed",
+    ] {
+        assert!(!lines.contains(forbidden));
+    }
+    let pending = json!({
+        "status": "awaiting_manual_acceptance_or_status_verification",
+        "diagnostic": document["diagnostic"],
+    });
+    let pending_lines = document_attention(&pending).join("\n");
+    assert!(pending_lines.contains("check acceptance or status in ePost, then retry"));
+    assert!(!pending_lines.contains("download it manually"));
 }

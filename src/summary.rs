@@ -7,6 +7,10 @@
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+/// A verified metadata response does not prove deletion or web availability.
+/// Keep the diagnosis scoped to the public API and offer a manual recovery path.
+pub const PUBLIC_API_CONTENT_UNAVAILABLE_MESSAGE: &str = "public API cannot download this item (HTTP 404), although its metadata is accessible; check or download it manually in the ePost app or website";
+
 /// Aggregated fixed explanations for partial retrieval and uncertain inventory.
 pub fn attention_lines(report: &Value) -> Vec<String> {
     let mut reasons = BTreeMap::<String, usize>::new();
@@ -134,12 +138,10 @@ fn diagnostic_reason(diagnostic: &Value) -> Option<&'static str> {
                 && diagnostic["has_message"] == true =>
         {
             Some(
-                "message exists in letter metadata, but downloadable content is unavailable; review it in ePost",
+                "message exists in letter metadata, but the public API cannot download content (HTTP 404); review this item in the ePost app or website",
             )
         }
-        "content_unavailable_metadata_available" => Some(
-            "document metadata is available, but content returned HTTP 404; check the document in ePost",
-        ),
+        "content_unavailable_metadata_available" => Some(PUBLIC_API_CONTENT_UNAVAILABLE_MESSAGE),
         "letter_unavailable" => {
             Some("document metadata and content returned HTTP 404; check the document in ePost")
         }
