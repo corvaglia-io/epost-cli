@@ -31,6 +31,7 @@ pub struct SaveResult {
     pub bytes: u64,
     pub status: String,
     pub media_kind: String,
+    pub content_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -348,6 +349,7 @@ impl Store {
             bytes: record.bytes,
             status: status.to_owned(),
             media_kind: record.kind.name().to_owned(),
+            content_type: record.content_type.clone(),
         }
     }
 }

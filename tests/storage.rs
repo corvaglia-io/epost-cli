@@ -82,6 +82,7 @@ fn opaque_malicious_ids_and_sources_never_become_paths() {
             .save(id, "archive:../../fictional-folder", &bytes, None)
             .unwrap();
         assert!(saved.path.starts_with(&fixture.root));
+        assert_eq!(saved.content_type, None);
         assert_eq!(saved.path.extension().unwrap(), "pdf");
         let name = saved.path.file_stem().unwrap().to_str().unwrap();
         assert_eq!(name.len(), 64);
@@ -113,10 +114,14 @@ fn repeat_runs_verify_and_record_all_inbox_archive_sources() {
     assert_eq!(second.path, third.path);
     assert_eq!(second.status, "already_saved");
     assert_eq!(third.status, "already_saved");
+    for result in [&first, &second, &third] {
+        assert_eq!(result.content_type.as_deref(), Some("application/pdf"));
+    }
     let manifest = fixture.read_manifest("synthetic-private");
     let entries = manifest["entries"].as_object().unwrap();
     assert_eq!(entries.len(), 1);
     let record = entries.values().next().unwrap();
+    assert_eq!(record["content_type"], "application/pdf");
     assert_eq!(
         record["sources"],
         serde_json::json!(["archive:folder:invented", "archive:root", "inbox"])
@@ -348,14 +353,17 @@ fn classifies_successful_content_from_bytes_and_preserves_it_exactly() {
         let saved = store.save(id, "inbox", bytes, content_type).unwrap();
         assert_eq!(saved.status, status);
         assert_eq!(saved.media_kind, media_kind);
+        assert_eq!(saved.content_type.as_deref(), content_type);
         assert_eq!(saved.bytes, bytes.len() as u64);
         assert_eq!(saved.sha256, hex::encode(Sha256::digest(bytes)));
         assert_eq!(fs::read(&saved.path).unwrap(), bytes);
         let repeat = store.verify_existing(id, "archive:root").unwrap().unwrap();
         assert_eq!(repeat.media_kind, media_kind);
         assert_eq!(repeat.status, "already_saved");
+        assert_eq!(repeat.content_type.as_deref(), content_type);
         let json = serde_json::to_value(repeat).unwrap();
         assert!(json["path"].is_string());
+        assert_eq!(json["content_type"], serde_json::json!(content_type));
     }
 }
 
