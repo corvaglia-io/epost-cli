@@ -9,7 +9,9 @@ use crate::destinations::{
     PaperlessDestination, SourceField, destination_identity, ledger_name, validate_destination,
 };
 use crate::error::{Error, Result};
-use crate::paperless::{PaperlessClient, TaskStatus, UploadMetadata, normalize_url};
+use crate::paperless::{
+    PaperlessClient, TaskFailureCode, TaskStatus, UploadMetadata, normalize_url,
+};
 use crate::storage::{SavedDocument, Store};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -119,6 +121,36 @@ pub enum DeliveryItemStatus {
     NotAttempted,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryReasonCode {
+    Duplicate,
+    ProtectedPdf,
+    Unsupported,
+    ProcessingFailure,
+    UploadOutcomeUnknown,
+    ReconciliationAmbiguous,
+    Pending,
+    UnsupportedContent,
+    VerificationFailed,
+    AuthenticationFailed,
+    AccessBlocked,
+    DeferredLimit,
+    NotAttempted,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryRecoveryAction {
+    Resume,
+    ReconcileExplicitly,
+    InspectPaperless,
+    ReviewSource,
+    RestoreAccess,
+    CheckDestination,
+    RetryVerification,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryItem {
     pub document_ref: String,
@@ -127,6 +159,10 @@ pub struct DeliveryItem {
     pub document_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<DeliveryReasonCode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_action: Option<DeliveryRecoveryAction>,
     #[serde(skip)]
     authentication_failed: bool,
     #[serde(skip)]
@@ -232,9 +268,28 @@ struct DeliveryRecord {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum DeliveryState {
     Uploading,
-    Pending { task_id: String },
-    TaskFailed { task_id: String },
-    Verified { document_id: i64 },
+    Pending {
+        task_id: String,
+    },
+    TaskFailed {
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure_code: Option<TaskFailureCode>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        related_document_id: Option<i64>,
+    },
+    Verified {
+        document_id: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provenance: Option<VerificationProvenance>,
+    },
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum VerificationProvenance {
+    ExistingDuplicate,
+    ExistingDocument,
 }
 
 pub fn load_target(store: &Store) -> Result<PaperlessTarget> {
@@ -433,7 +488,7 @@ async fn deliver_inner(
         let bytes = store.read_saved(&document.letter_id)?;
         if context.cached_verified
             && let Some(DeliveryRecord {
-                state: DeliveryState::Verified { document_id },
+                state: DeliveryState::Verified { document_id, .. },
                 ..
             }) = ledger.entries.get(&reference)
         {
@@ -509,7 +564,7 @@ async fn deliver_inner(
             }
         };
         let result = match &record.state {
-            DeliveryState::Verified { document_id } => {
+            DeliveryState::Verified { document_id, .. } => {
                 progress(report.event(DeliveryPhase::Verifying, documents.len()));
                 match verify_original(client, *document_id, document).await {
                     Ok(()) => item(
@@ -526,7 +581,7 @@ async fn deliver_inner(
                     ),
                 }
             }
-            DeliveryState::Uploading | DeliveryState::TaskFailed { .. } => {
+            DeliveryState::Uploading => {
                 progress(report.event(DeliveryPhase::Reconciling, documents.len()));
                 reconcile_record(
                     store,
@@ -535,6 +590,66 @@ async fn deliver_inner(
                     &mut ledger,
                     document,
                     &record,
+                    context,
+                )
+                .await?
+            }
+            DeliveryState::TaskFailed {
+                task_id,
+                failure_code,
+                related_document_id,
+            } => {
+                // Older journals retained only the task ID. A GET can recover
+                // its redacted category/reference; a vanished task never erases
+                // the failure already observed and never authorizes a repost.
+                let mut failed = record.clone();
+                match client.task(task_id).await {
+                    Ok(Some(task)) if task.status == TaskStatus::Failure => {
+                        if related_document_id
+                            .zip(task.document_id)
+                            .is_some_and(|(known, current)| known != current)
+                        {
+                            report.add(item(
+                                &reference,
+                                DeliveryItemStatus::Failed,
+                                None,
+                                Some("Paperless task reference changed; choose a document explicitly for reconciliation"),
+                            ));
+                            continue;
+                        }
+                        let refreshed_code = match (failure_code, task.failure_code) {
+                            // Sparse/expired result details are not evidence
+                            // against the category retained from the same task.
+                            (Some(known), Some(TaskFailureCode::ProcessingFailure)) => Some(*known),
+                            (_, current) => current.or(*failure_code),
+                        };
+                        failed.state = DeliveryState::TaskFailed {
+                            task_id: task_id.clone(),
+                            failure_code: refreshed_code,
+                            related_document_id: task.document_id.or(*related_document_id),
+                        };
+                        ledger.entries.insert(reference.clone(), failed.clone());
+                        persist(store, &context.ledger_name, &ledger)?;
+                    }
+                    Ok(_) | Err(Error::Http(404)) => (),
+                    Err(error) => {
+                        report.add(item_error(
+                            &reference,
+                            DeliveryItemStatus::Failed,
+                            None,
+                            &error,
+                        ));
+                        continue;
+                    }
+                }
+                progress(report.event(DeliveryPhase::Reconciling, documents.len()));
+                reconcile_record(
+                    store,
+                    client,
+                    target,
+                    &mut ledger,
+                    document,
+                    &failed,
                     context,
                 )
                 .await?
@@ -572,8 +687,16 @@ async fn deliver_inner(
                             break;
                         }
                         Err(error) => {
-                            result =
-                                item_error(&reference, DeliveryItemStatus::Pending, None, &error);
+                            result = item_error(
+                                &reference,
+                                if matches!(error, Error::InvalidResponse(_)) {
+                                    DeliveryItemStatus::Failed
+                                } else {
+                                    DeliveryItemStatus::Pending
+                                },
+                                None,
+                                &error,
+                            );
                             break;
                         }
                     };
@@ -584,6 +707,8 @@ async fn deliver_inner(
                             let failed = DeliveryRecord {
                                 state: DeliveryState::TaskFailed {
                                     task_id: task_id.clone(),
+                                    failure_code: task.failure_code,
+                                    related_document_id: task.document_id,
                                 },
                                 ..record.clone()
                             };
@@ -686,6 +811,51 @@ pub async fn reconcile_document(
     letter_id: &str,
     document_id: i64,
 ) -> Result<DeliveryItem> {
+    reconcile_document_for(
+        store,
+        client,
+        target,
+        letter_id,
+        document_id,
+        &DeliveryContext::legacy(),
+        false,
+    )
+    .await
+}
+
+/// Adopt an explicitly selected existing document after verifying its original
+/// bytes. Preserve its metadata/review state and bind the proof to this named
+/// destination. Automatic reconciliation still enforces new-upload review tags.
+pub async fn reconcile_paperless(
+    store: &mut Store,
+    client: &PaperlessClient,
+    destination: &Destination,
+    letter_id: &str,
+    document_id: i64,
+) -> Result<DeliveryItem> {
+    let context = DeliveryContext::named(store, destination, true)?;
+    let target = &context.config.as_ref().expect("named configuration").target;
+    reconcile_document_for(
+        store,
+        client,
+        target,
+        letter_id,
+        document_id,
+        &context,
+        true,
+    )
+    .await
+}
+
+async fn reconcile_document_for(
+    store: &mut Store,
+    client: &PaperlessClient,
+    target: &PaperlessTarget,
+    letter_id: &str,
+    document_id: i64,
+    context: &DeliveryContext,
+    explicit_existing: bool,
+) -> Result<DeliveryItem> {
     validate_client(client, target)?;
     if document_id <= 0 {
         return Err(Error::Config(
@@ -702,10 +872,11 @@ pub async fn reconcile_document(
     }
     let _ = store.read_saved(letter_id)?;
     let reference = document_ref(store, letter_id);
-    let mut ledger = load_ledger(store, target)?;
+    let mut ledger = load_ledger_for(store, target, context)?;
     if let Some(DeliveryRecord {
         state: DeliveryState::Verified {
             document_id: saved_id,
+            ..
         },
         ..
     }) = ledger.entries.get(&reference)
@@ -723,23 +894,53 @@ pub async fn reconcile_document(
             None,
         ));
     }
-    verify_new_document(client, target, document_id, &document).await?;
+    let duplicate = ledger.entries.get(&reference).is_some_and(|record| {
+        matches!(
+            record.state,
+            DeliveryState::TaskFailed {
+                failure_code: Some(TaskFailureCode::Duplicate),
+                ..
+            }
+        )
+    });
+    if duplicate || explicit_existing {
+        verify_original(client, document_id, &document).await?;
+    } else {
+        verify_new_document_for(client, target, document_id, &document, context).await?;
+    }
     ledger.entries.insert(
         reference.clone(),
         DeliveryRecord {
             sha256: document.sha256.clone(),
             bytes: document.bytes,
-            filename: upload_filename(store, &document),
-            state: DeliveryState::Verified { document_id },
+            filename: upload_filename_for(store, &document, context),
+            state: DeliveryState::Verified {
+                document_id,
+                provenance: if duplicate {
+                    Some(VerificationProvenance::ExistingDuplicate)
+                } else if explicit_existing {
+                    Some(VerificationProvenance::ExistingDocument)
+                } else {
+                    None
+                },
+            },
         },
     );
-    persist(store, LEDGER_NAME, &ledger)?;
-    Ok(item(
+    persist(store, &context.ledger_name, &ledger)?;
+    let mut result = item(
         &reference,
-        DeliveryItemStatus::Delivered,
+        if duplicate || explicit_existing {
+            DeliveryItemStatus::AlreadyDelivered
+        } else {
+            DeliveryItemStatus::Delivered
+        },
         Some(document_id),
         None,
-    ))
+    );
+    if duplicate {
+        result.reason_code = Some(DeliveryReasonCode::Duplicate);
+    }
+    Ok(result)
 }
 
 async fn reconcile_record(
@@ -753,11 +954,55 @@ async fn reconcile_record(
 ) -> Result<DeliveryItem> {
     let reference = document_ref(store, &document.letter_id);
     let reference = reference.as_str();
+    let failure_code = match &record.state {
+        DeliveryState::TaskFailed { failure_code, .. } => {
+            Some(failure_code.unwrap_or(TaskFailureCode::ProcessingFailure))
+        }
+        _ => None,
+    };
+    let duplicate = failure_code == Some(TaskFailureCode::Duplicate);
     let failure_status = if matches!(record.state, DeliveryState::TaskFailed { .. }) {
         DeliveryItemStatus::Failed
     } else {
         DeliveryItemStatus::Uncertain
     };
+    if let DeliveryState::TaskFailed {
+        related_document_id: Some(id),
+        ..
+    } = record.state
+    {
+        let verified = if duplicate {
+            // This PDF was already present before the attempted ingestion.
+            // Its review state and metadata belong to that existing document.
+            verify_original(client, id, document).await
+        } else {
+            verify_new_document_for(client, target, id, document, context).await
+        };
+        return Ok(match verified {
+            Ok(()) => {
+                mark_verified_with_provenance(
+                    store,
+                    ledger,
+                    reference,
+                    id,
+                    duplicate.then_some(VerificationProvenance::ExistingDuplicate),
+                    context,
+                )?;
+                confirmed_reconciliation_item(reference, id, duplicate)
+            }
+            Err(error) => {
+                let mut result = item_error(reference, failure_status, Some(id), &error);
+                if duplicate && !result.authentication_failed && !result.access_blocked {
+                    // An unavailable or mismatching original does not erase
+                    // Paperless's confirmed duplicate rejection. Keep explicit
+                    // reconciliation guidance without adopting unverified bytes.
+                    result.reason_code = Some(DeliveryReasonCode::Duplicate);
+                    result.recovery_action = Some(DeliveryRecoveryAction::ReconcileExplicitly);
+                }
+                result
+            }
+        });
+    }
     let candidates = match client.find_documents(&record.filename).await {
         Ok(candidates) => candidates,
         Err(error) => return Ok(item_error(reference, failure_status, None, &error)),
@@ -798,7 +1043,9 @@ async fn reconcile_record(
         [document_id] => {
             // The original was already checked above; avoid downloading it a
             // second time merely to check the review queue metadata.
-            if let Err(error) = verify_review_tags_for(client, target, *document_id, context).await
+            if !duplicate
+                && let Err(error) =
+                    verify_review_tags_for(client, target, *document_id, context).await
             {
                 return Ok(item_error(
                     reference,
@@ -807,14 +1054,24 @@ async fn reconcile_record(
                     &error,
                 ));
             }
-            mark_verified_for(store, ledger, reference, *document_id, context)?;
-            Ok(item(
+            mark_verified_with_provenance(
+                store,
+                ledger,
                 reference,
-                DeliveryItemStatus::Delivered,
-                Some(*document_id),
-                None,
+                *document_id,
+                duplicate.then_some(VerificationProvenance::ExistingDuplicate),
+                context,
+            )?;
+            Ok(confirmed_reconciliation_item(
+                reference,
+                *document_id,
+                duplicate,
             ))
         }
+        [] if failure_code.is_some() => Ok(task_failure_item(
+            reference,
+            failure_code.expect("known failure"),
+        )),
         [] => Ok(item(
             reference,
             failure_status,
@@ -823,15 +1080,66 @@ async fn reconcile_record(
                 "upload outcome cannot be confirmed; no automatic resubmission; reconcile a matching Paperless document explicitly",
             ),
         )),
-        _ => Ok(item(
-            reference,
-            failure_status,
-            None,
-            Some(
-                "multiple Paperless originals match this upload; choose a document explicitly for reconciliation",
-            ),
-        )),
+        _ => {
+            let mut result = item(
+                reference,
+                failure_status,
+                None,
+                Some(
+                    "multiple Paperless originals match this upload; choose a document explicitly for reconciliation",
+                ),
+            );
+            result.reason_code = Some(DeliveryReasonCode::ReconciliationAmbiguous);
+            result.recovery_action = Some(DeliveryRecoveryAction::ReconcileExplicitly);
+            Ok(result)
+        }
     }
+}
+
+fn confirmed_reconciliation_item(reference: &str, id: i64, duplicate: bool) -> DeliveryItem {
+    let mut result = item(
+        reference,
+        if duplicate {
+            DeliveryItemStatus::AlreadyDelivered
+        } else {
+            DeliveryItemStatus::Delivered
+        },
+        Some(id),
+        None,
+    );
+    if duplicate {
+        result.reason_code = Some(DeliveryReasonCode::Duplicate);
+    }
+    result
+}
+
+fn task_failure_item(reference: &str, code: TaskFailureCode) -> DeliveryItem {
+    let (reason, message, action) = match code {
+        TaskFailureCode::Duplicate => (
+            DeliveryReasonCode::Duplicate,
+            "Paperless rejected a duplicate; its existing original has not been verified; reconcile a matching document explicitly; no automatic resubmission",
+            DeliveryRecoveryAction::ReconcileExplicitly,
+        ),
+        TaskFailureCode::ProtectedPdf => (
+            DeliveryReasonCode::ProtectedPdf,
+            "Paperless reported a protected PDF processing failure; inspect the task in Paperless; a matching PDF may already be present; no automatic resubmission",
+            DeliveryRecoveryAction::InspectPaperless,
+        ),
+        TaskFailureCode::Unsupported => (
+            DeliveryReasonCode::Unsupported,
+            "Paperless reported an unsupported file type; inspect the task in Paperless; a matching PDF may already be present; no automatic resubmission",
+            DeliveryRecoveryAction::InspectPaperless,
+        ),
+        TaskFailureCode::ProcessingFailure => (
+            DeliveryReasonCode::ProcessingFailure,
+            "Paperless reported an ingestion task failure; inspect the task in Paperless; a matching PDF may already be present; no automatic resubmission",
+            DeliveryRecoveryAction::InspectPaperless,
+        ),
+    };
+    let mut result = item(reference, DeliveryItemStatus::Failed, None, Some(message));
+    result.reason_code = Some(reason);
+    result.recovery_action = Some(action);
+    result
 }
 
 async fn verify_original(client: &PaperlessClient, id: i64, local: &SavedDocument) -> Result<()> {
@@ -842,15 +1150,6 @@ async fn verify_original(client: &PaperlessClient, id: i64, local: &SavedDocumen
         ));
     }
     Ok(())
-}
-
-async fn verify_new_document(
-    client: &PaperlessClient,
-    target: &PaperlessTarget,
-    id: i64,
-    local: &SavedDocument,
-) -> Result<()> {
-    verify_new_document_for(client, target, id, local, &DeliveryContext::legacy()).await
 }
 
 async fn verify_new_document_for(
@@ -902,11 +1201,25 @@ fn mark_verified_for(
     document_id: i64,
     context: &DeliveryContext,
 ) -> Result<()> {
+    mark_verified_with_provenance(store, ledger, reference, document_id, None, context)
+}
+
+fn mark_verified_with_provenance(
+    store: &mut Store,
+    ledger: &mut Ledger,
+    reference: &str,
+    document_id: i64,
+    provenance: Option<VerificationProvenance>,
+    context: &DeliveryContext,
+) -> Result<()> {
     ledger
         .entries
         .get_mut(reference)
         .ok_or(Error::Storage("Paperless delivery record is missing"))?
-        .state = DeliveryState::Verified { document_id };
+        .state = DeliveryState::Verified {
+        document_id,
+        provenance,
+    };
     persist(store, &context.ledger_name, ledger)
 }
 
@@ -959,14 +1272,22 @@ fn load_ledger_for(
             ));
         }
         match &record.state {
-            DeliveryState::Pending { task_id } | DeliveryState::TaskFailed { task_id }
+            DeliveryState::Pending { task_id } | DeliveryState::TaskFailed { task_id, .. }
                 if !valid_task_id(task_id) =>
             {
                 return Err(Error::Storage(
                     "Paperless delivery task identifier is invalid",
                 ));
             }
-            DeliveryState::Verified { document_id } if *document_id <= 0 => {
+            DeliveryState::Verified { document_id, .. } if *document_id <= 0 => {
+                return Err(Error::Storage(
+                    "Paperless delivery document identifier is invalid",
+                ));
+            }
+            DeliveryState::TaskFailed {
+                related_document_id: Some(document_id),
+                ..
+            } if *document_id <= 0 => {
                 return Err(Error::Storage(
                     "Paperless delivery document identifier is invalid",
                 ));
@@ -1015,10 +1336,6 @@ fn document_ref(store: &Store, letter_id: &str) -> String {
     hash.update(b"\0");
     hash.update(letter_id.as_bytes());
     hex::encode(hash.finalize())
-}
-
-fn upload_filename(store: &Store, document: &SavedDocument) -> String {
-    upload_filename_for(store, document, &DeliveryContext::legacy())
 }
 
 fn upload_filename_for(
@@ -1481,11 +1798,40 @@ fn item(
     document_id: Option<i64>,
     error: Option<&str>,
 ) -> DeliveryItem {
+    let (reason_code, recovery_action) = match status {
+        DeliveryItemStatus::Pending => (
+            Some(DeliveryReasonCode::Pending),
+            Some(DeliveryRecoveryAction::Resume),
+        ),
+        DeliveryItemStatus::Uncertain => (
+            Some(DeliveryReasonCode::UploadOutcomeUnknown),
+            Some(DeliveryRecoveryAction::ReconcileExplicitly),
+        ),
+        DeliveryItemStatus::Failed => (
+            Some(DeliveryReasonCode::VerificationFailed),
+            Some(DeliveryRecoveryAction::RetryVerification),
+        ),
+        DeliveryItemStatus::Unsupported => (
+            Some(DeliveryReasonCode::UnsupportedContent),
+            Some(DeliveryRecoveryAction::ReviewSource),
+        ),
+        DeliveryItemStatus::DeferredLimit => (
+            Some(DeliveryReasonCode::DeferredLimit),
+            Some(DeliveryRecoveryAction::Resume),
+        ),
+        DeliveryItemStatus::NotAttempted => (
+            Some(DeliveryReasonCode::NotAttempted),
+            Some(DeliveryRecoveryAction::Resume),
+        ),
+        _ => (None, None),
+    };
     DeliveryItem {
         document_ref: reference.to_owned(),
         status,
         document_id,
         error: error.map(str::to_owned),
+        reason_code,
+        recovery_action,
         authentication_failed: false,
         access_blocked: false,
     }
@@ -1497,12 +1843,16 @@ fn item_error(
     document_id: Option<i64>,
     error: &Error,
 ) -> DeliveryItem {
-    DeliveryItem {
-        document_ref: reference.to_owned(),
-        status,
-        document_id,
-        error: Some(error.to_string()),
-        authentication_failed: matches!(error, Error::Auth | Error::Http(401 | 403)),
-        access_blocked: matches!(error, Error::PaperlessRedirect { .. }),
+    let message = error.to_string();
+    let mut result = item(reference, status, document_id, Some(&message));
+    result.authentication_failed = matches!(error, Error::Auth | Error::Http(401 | 403));
+    result.access_blocked = matches!(error, Error::PaperlessRedirect { .. });
+    if result.authentication_failed {
+        result.reason_code = Some(DeliveryReasonCode::AuthenticationFailed);
+        result.recovery_action = Some(DeliveryRecoveryAction::RestoreAccess);
+    } else if result.access_blocked {
+        result.reason_code = Some(DeliveryReasonCode::AccessBlocked);
+        result.recovery_action = Some(DeliveryRecoveryAction::CheckDestination);
     }
+    result
 }

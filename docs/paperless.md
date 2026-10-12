@@ -5,11 +5,18 @@ Paperless is an optional configured destination. `epost check inbox` uses every 
 ## Named destinations and metadata
 
 Use `epost destination add` for current guided setup; `epost destination edit NAME`
-retains history and offers token replacement. The wizard proposes **Inbox**
-with `is_inbox_tag=true` and **ePost** as a regular source tag. You can choose
+retains history and offers token replacement. The wizard proposes **inbox**
+with `is_inbox_tag=true` and **epost** as a separate regular source tag. You can choose
 custom names and extra tags. Existing migrated **ePost Inbox** is preserved.
 An existing tag with the wrong inbox flag is never silently modified. Creation
 of tags and selected custom fields is explicit; setup uploads no documents.
+
+Keep `epost` as the permanent source label; remove `inbox` after you have processed
+the document. To align an existing setup, rename its regular source tag to
+`epost` and its inbox tag to `inbox` in Paperless. Renaming keeps their IDs and
+document assignments, so the CLI's saved bindings still work. Do not replace
+the tags or add `inbox` back to reviewed documents. Editing a destination proposes
+its existing tag names rather than silently creating new ones.
 
 Document types are optional. The default leaves classification to Paperless.
 Choose an existing fixed type, or an explicit mapping such as
@@ -17,6 +24,21 @@ Choose an existing fixed type, or an explicit mapping such as
 upstream `documentTypes` match is sent; missing/conflicting metadata is omitted.
 The transport `letterType` is not a semantic document type. The wizard does not
 create types or enable server workflows/classifiers.
+
+For a small personal archive, a useful starting set is **Invoice**, **Statement**,
+**Contract** and **Correspondence**. Create the types in Paperless and set their
+matching algorithm to **Auto** (or explicit rules if predictable text works
+better). Review and correct the first batch's type, title, correspondent and
+date, then remove the inbox tag. Paperless's Auto classifier learns from reviewed
+documents without inbox tags; new types need enough reviewed examples before
+matching becomes useful. Leaving the CLI's type policy automatic omits
+`document_type` from uploads, allowing Paperless's configured classifier to run.
+A fixed type makes sense only when every document has the same purpose; explicit
+ePost mappings are useful only when reliable semantic `documentTypes` metadata
+exists. No additional LLM is required for this workflow.
+
+See the [official matching guide](https://docs.paperless-ngx.com/advanced_usage/#automatic-matching)
+and [recommended review workflow](https://docs.paperless-ngx.com/usage/#usage-recommended-workflow).
 
 Optional provenance mappings create/select **Text** custom fields for document
 ID, received timestamp, original filename and raw document types, plus static
@@ -83,7 +105,29 @@ An HTTPS API must be reachable with the token alone. Redirects are reported with
 
 The CLI verifies each local PDF, records upload intent durably, uploads it once with the configured tags, then polls the asynchronous consumption task. It confirms the original's byte count and SHA-256 through a separate download before recording delivery. New confirmations also check that the intended tags are present and that the inbox flag is still enabled. PDFs use deterministic opaque filenames for recovery; the legacy single-target uploader does not copy titles, correspondents or dates. Named destinations support the optional title and provenance mappings described above; receipt time is never used as an issue date.
 
-Pending task IDs persist across runs. If a connection or crash loses the upload receipt, retrying looks for the exact deterministic original filename and verifies its bytes. An empty search does not prove the upload was never accepted, so uncertain uploads are never automatically submitted again. A terminal ingestion failure similarly requires reconciliation or manual correction. Existing copies with different filenames are not guessed or adopted automatically.
+Pending task IDs persist across runs. If a connection or crash loses the upload receipt, retrying looks for the exact deterministic original filename and verifies its bytes. An empty search does not prove the upload was never accepted, so uncertain uploads are never automatically submitted again. Confirmed task failures are distinguished from uncertain upload outcomes, using fixed reason codes without saving provider error text.
+
+When Paperless identifies a duplicate, the CLI checks the referenced existing
+original's byte count and SHA-256 against the local PDF. A match confirms delivery
+without another upload, even if the existing filename differs. Existing tags,
+types and reviewed status are preserved; an inbox tag is not required or restored.
+Missing, conflicting or mismatched duplicate references remain attention. Older
+failed-task journals are refreshed by task GET before classification; failures
+are never automatically resubmitted. New successful ingestion still verifies
+its configured initial tags. Explicit `verify` checks adopted originals by bytes.
+
+For a named destination, explicitly reconcile a manually located original:
+
+```sh
+epost reconcile main synthetic-letter-id --document-id 42
+```
+
+This requires an existing locally saved PDF and a positive Paperless document ID.
+It needs destination access only, verifies the original bytes, preserves server
+metadata, and never uploads or retags. Choosing a wrong document or another
+instance cannot record success. Use the saved letter ID from your private metadata
+or browse report; normal summaries omit identifiers. Legacy single-target
+reconciliation below additionally checks its configured initial tags.
 
 ```sh
 # Bounded first batch; later runs advance beyond already verified documents

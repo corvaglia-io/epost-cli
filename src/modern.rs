@@ -54,6 +54,18 @@ pub(super) struct DeliveryArgs {
     #[arg(long)]
     pub output: Option<PathBuf>,
 }
+#[derive(Args, Clone)]
+pub(super) struct ReconcileArgs {
+    /// Named Paperless destination.
+    pub destination: String,
+    /// Saved ePost letter ID whose original must match.
+    pub letter_id: String,
+    /// Existing Paperless document; its original bytes must match exactly.
+    #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+    pub document_id: i64,
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+}
 #[derive(Subcommand, Clone)]
 pub(super) enum ProfileCommand {
     /// Show configured profiles and the default.
@@ -88,6 +100,32 @@ pub(super) async fn run(cli: &Cli) -> Result<(Value, u8)> {
         }
         Command::Deliver(args) | Command::Verify(args) => {
             deliveries(cli, args, matches!(cli.command, Command::Verify(_))).await
+        }
+        Command::Reconcile(args) => {
+            let (root, mut store) = destination_cli::open_store(cli, args.output.as_deref())?;
+            let mut selected =
+                destinations::select(&store, std::slice::from_ref(&args.destination))?;
+            let destination = selected
+                .pop()
+                .ok_or(Error::Config("destination is missing"))?;
+            if !matches!(destination.kind, DestinationKind::Paperless(_)) {
+                return Err(Error::Config("reconcile requires a Paperless destination"));
+            }
+            let client = destination_cli::client_for(cli, &root, &store, &destination)?;
+            progress_line(cli, "Reconcile: verifying the selected existing original…");
+            let item = delivery::reconcile_paperless(
+                &mut store,
+                &client,
+                &destination,
+                &args.letter_id,
+                args.document_id,
+            )
+            .await?;
+            let report = json!({"delivered":0,"already_delivered":1,"items":[item]});
+            Ok((
+                json!({"destinations":[{"name":args.destination,"kind":"paperless","delivery":report,"exit_code":0}],"reconciled":true}),
+                0,
+            ))
         }
         Command::Check(args) => {
             let mb = mailbox(cli)?;

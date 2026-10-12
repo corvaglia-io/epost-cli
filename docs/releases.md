@@ -25,15 +25,15 @@ The command examples assume this is your selected platform; change the target fo
 
 ## Prepare and trigger a release
 
-The package version is `0.2.0`. Merge the reviewed implementation and release notes into main before tagging it. The `v0.1.0` release remains available. For later releases update Cargo.toml/Cargo.lock and release notes in a reviewed PR first.
+The package version is `0.2.1`. The `v0.2.0` release remains unchanged. Merge the reviewed implementation and release notes into main before tagging it. The `v0.1.0` release remains available. For later releases update Cargo.toml/Cargo.lock and release notes in a reviewed PR first.
 
 Run these steps as the maintainer when ready to publish:
 
 ```sh
 git switch main
 git pull --ff-only
-git tag -a v0.2.0 -m 'epost-cli v0.2.0'
-git push origin v0.2.0
+git tag -a v0.2.1 -m 'epost-cli v0.2.1'
+git push origin v0.2.1
 ```
 
 Tag pushes matching `v*` trigger validation. The tag must exactly equal `v` plus the package version and resolve to a commit already merged into main. Tests/formatting/Clippy run with locked dependencies, and all four native binaries must build and pass credential-free version/help smoke checks. Archives receive SHA-256 checksums. Build jobs have read-only repository permissions and no ePost secrets.

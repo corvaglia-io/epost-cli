@@ -153,8 +153,7 @@ pub(super) fn prepare(cli: &mut Cli, names: &[String], explicit: Option<&Path>) 
                     cli.prepared_destination_tokens
                         .insert(destination.name.clone(), secret);
                 }
-                Err(error) => {
-                    eprintln!("{}: {error}", destination.name);
+                Err(_) => {
                     cli.prepared_destination_failures
                         .insert(destination.name.clone());
                 }
@@ -333,6 +332,7 @@ async fn configure_metadata(
         config.extra_tag_ids.clear();
     }
     ui.line("Document type: 1 = let Paperless classify, 2 = fixed type, 3 = explicit ePost type mapping.")?;
+    ui.line("Recommended: create Invoice, Statement, Contract and Correspondence in Paperless, with Auto matching. Review the first documents, correct their type, then remove inbox so Paperless can learn.")?;
     loop {
         let policy = ui.default("Document type policy", "1")?;
         match policy.as_str() {
@@ -745,17 +745,18 @@ async fn configure_paperless(
     };
     let client = paperless_cli::make_client(cli, &config.target.url, secret.clone())?;
     let existing = client.tags().await?;
+    ui.line("Use two separate tags: epost is the permanent source; inbox is removed after you process the document. Repeat runs do not restore removed review tags.")?;
     let inbox_suggestion = existing
         .iter()
         .find(|t| editing && t.id == config.target.inbox_tag_id)
         .map(|t| t.name.as_str())
-        .unwrap_or("Inbox");
+        .unwrap_or("inbox");
     config.target.inbox_tag_id = choose_tag(ui, &client, inbox_suggestion, true).await?.id;
     let source_suggestion = existing
         .iter()
         .find(|t| editing && Some(t.id) == config.target.source_tag_id)
         .map(|t| t.name.as_str())
-        .unwrap_or("ePost");
+        .unwrap_or("epost");
     config.target.source_tag_id = Some(choose_tag(ui, &client, source_suggestion, false).await?.id);
     if !editing || ui.yes("Replace extra tags, type policy and custom field mappings? Existing settings are kept if no.", false)? { configure_metadata(ui, &client, config).await?; }
     config.target.remember_token = if keychain::supported() && cli.mock_url.is_none() {

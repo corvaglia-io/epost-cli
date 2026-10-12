@@ -43,6 +43,7 @@ never guesses the account. All commands accept global `--config` and `--profile`
 | `epost browse inbox` / `epost browse archive` | Interactive metadata pages and numbered download selection. |
 | `epost deliver` | Resume delivery of saved PDFs without an ePost login. |
 | `epost verify` | Audit existing recorded destination copies and local bytes; never upload an unsubmitted PDF or create a new folder copy. |
+| `epost reconcile main synthetic-letter-id --document-id 42` | Explicitly adopt an existing Paperless original after its bytes match the saved PDF. No source login, upload or tag changes. |
 | `epost doctor` | Read-only diagnostics for local integrity, credentials without prompts, source access, DNS/TLS/proxy routing and destination catalogs. |
 | `epost doctor --offline` | Check local state only; no network or Keychain access. |
 | `epost destination add` | Guided destination setup. |
@@ -67,7 +68,11 @@ mailbox coverage. Registered letters needing acceptance require action in ePost.
 ## Display and automation
 
 On a capable terminal, commands show Ratatui progress, restore the terminal,
-print a lasting text summary and exit. The menu remains open until quit.
+print a compact text summary and exit. In the menu, a lasting result screen
+separates retrieval, destinations and issues, with a next step for each problem.
+Enter returns to the menu; `r` explicitly retries, `g` opens Doctor, `d` shows
+technical details, and `q`/Esc quits. Up/down and Page Up/Down scroll long results.
+Retries re-read credentials and resume existing ingestion without blindly reposting.
 Setup and browse use the same validation logic with Ratatui prompts. Secrets
 are masked and never added to display history. `q`/Esc during progress requests
 a stop after the current request and durable bookkeeping; it does not interrupt
@@ -78,6 +83,9 @@ escapes. `--no-progress` suppresses progress. `--json` emits the structured resu
 and suppresses the TUI/default progress; explicit `--progress` can still provide
 plain stderr diagnostics. Interactive configuration and browse reject `--json`.
 Bare `epost` in a pipe displays help without opening account configuration.
+Use global `--details` for expanded standalone text diagnostics; `--json` retains
+the complete structured report. Normal summaries count cached non-PDF content
+separately from reused PDFs, rather than counting it twice.
 
 ```sh
 # For Dagu, n8n, launchd or another scheduler after setup and permission grants:

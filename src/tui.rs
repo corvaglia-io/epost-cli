@@ -38,6 +38,11 @@ use zeroize::{Zeroize, Zeroizing};
 
 const HISTORY_LIMIT: usize = 100;
 const INPUT_LIMIT: usize = 8192;
+const RESULT_SECTION_LIMIT: usize = 12;
+const RESULT_LINE_LIMIT: usize = 32;
+const RESULT_ISSUE_LIMIT: usize = 12;
+const RESULT_DETAIL_LIMIT: usize = 100;
+const RESULT_TEXT_LIMIT: usize = 512;
 const ACCENT: Color = Color::Cyan;
 static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PANIC_HOOK: Once = Once::new();
@@ -96,6 +101,11 @@ impl TerminalGuard {
             Hide
         )?;
         guard.terminal = Some(Terminal::new(CrosstermBackend::new(io::stderr()))?);
+        // A new renderer has no previous buffer to erase. Clear explicitly so
+        // margins cannot retain text from the preceding progress or prompt view.
+        if let Some(terminal) = &mut guard.terminal {
+            terminal.clear()?;
+        }
         Ok(guard)
     }
 
@@ -570,6 +580,520 @@ pub(crate) fn home(
     }
 }
 
+/// The caller supplies already-redacted summaries, never credentials, provider
+/// response bodies or document contents. Display sanitization is not redaction.
+#[derive(Clone, Debug)]
+pub(crate) struct ResultView {
+    pub(crate) title: String,
+    pub(crate) status: ResultStatus,
+    pub(crate) sections: Vec<ResultSection>,
+    pub(crate) issues: Vec<ResultIssue>,
+    pub(crate) details: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResultStatus {
+    Success,
+    Attention,
+    Error,
+}
+
+impl ResultStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Success => "Completed",
+            Self::Attention => "Needs attention",
+            Self::Error => "Unable to complete",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Self::Success => Color::Green,
+            Self::Attention => Color::Yellow,
+            Self::Error => Color::Red,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResultSection {
+    pub(crate) title: String,
+    pub(crate) lines: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResultIssue {
+    pub(crate) heading: String,
+    pub(crate) explanation: String,
+    pub(crate) next_step: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResultAction {
+    Back,
+    Retry,
+    Doctor,
+    Quit,
+}
+
+struct ResultScreen {
+    view: ResultView,
+    sections_omitted: usize,
+    issues_omitted: usize,
+    details_omitted: usize,
+    show_details: bool,
+    scroll: usize,
+    max_scroll: usize,
+    page_height: usize,
+}
+
+impl ResultScreen {
+    fn new(view: &ResultView) -> Self {
+        Self {
+            view: ResultView {
+                title: result_text(&view.title, 120),
+                status: view.status,
+                sections: view
+                    .sections
+                    .iter()
+                    .take(RESULT_SECTION_LIMIT)
+                    .map(|section| {
+                        let mut lines: Vec<_> = section
+                            .lines
+                            .iter()
+                            .take(RESULT_LINE_LIMIT)
+                            .map(|line| result_text(line, RESULT_TEXT_LIMIT))
+                            .collect();
+                        if section.lines.len() > RESULT_LINE_LIMIT {
+                            lines.push("Additional rows omitted from this view.".into());
+                        }
+                        ResultSection {
+                            title: result_text(&section.title, 120),
+                            lines,
+                        }
+                    })
+                    .collect(),
+                issues: view
+                    .issues
+                    .iter()
+                    .take(RESULT_ISSUE_LIMIT)
+                    .map(|issue| ResultIssue {
+                        heading: result_text(&issue.heading, 120),
+                        explanation: result_text(&issue.explanation, RESULT_TEXT_LIMIT),
+                        next_step: result_text(&issue.next_step, RESULT_TEXT_LIMIT),
+                    })
+                    .collect(),
+                details: view
+                    .details
+                    .iter()
+                    .take(RESULT_DETAIL_LIMIT)
+                    .map(|line| result_text(line, RESULT_TEXT_LIMIT))
+                    .collect(),
+            },
+            sections_omitted: view.sections.len().saturating_sub(RESULT_SECTION_LIMIT),
+            issues_omitted: view.issues.len().saturating_sub(RESULT_ISSUE_LIMIT),
+            details_omitted: view.details.len().saturating_sub(RESULT_DETAIL_LIMIT),
+            show_details: false,
+            scroll: 0,
+            max_scroll: 0,
+            page_height: 1,
+        }
+    }
+
+    fn event(&mut self, event: Event) -> Option<ResultAction> {
+        let Event::Key(key) = event else {
+            return None;
+        };
+        if !pressed(key) {
+            return None;
+        }
+        if cancel_key(key) {
+            return Some(ResultAction::Quit);
+        }
+        // Only plain keys invoke actions. In particular, a modified key or
+        // pasted text must not accidentally trigger a retry.
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return None;
+        }
+        match key.code {
+            KeyCode::Enter => return Some(ResultAction::Back),
+            KeyCode::Char('r' | 'R') => return Some(ResultAction::Retry),
+            KeyCode::Char('g' | 'G') => return Some(ResultAction::Doctor),
+            KeyCode::Char('q' | 'Q') | KeyCode::Esc => return Some(ResultAction::Quit),
+            KeyCode::Char('d' | 'D') => {
+                self.show_details = !self.show_details;
+                self.scroll = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.scroll = self.scroll.saturating_add(1).min(self.max_scroll)
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::PageDown => {
+                self.scroll = self
+                    .scroll
+                    .saturating_add(self.page_height)
+                    .min(self.max_scroll)
+            }
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(self.page_height),
+            KeyCode::Home => self.scroll = 0,
+            KeyCode::End => self.scroll = self.max_scroll,
+            _ => {}
+        }
+        None
+    }
+
+    fn lines(&self, width: u16, cards: bool) -> Vec<Line<'static>> {
+        let width = usize::from(width);
+        let mut lines = Vec::new();
+        let normal = Style::default().fg(Color::Gray);
+        if self.show_details {
+            let mut details: Vec<_> = self
+                .view
+                .details
+                .iter()
+                .map(|text| (text.as_str(), normal))
+                .collect();
+            if details.is_empty() {
+                details.push(("No technical details were provided.", normal));
+            }
+            if self.details_omitted > 0 {
+                details.push((
+                    "Additional technical details omitted from this view.",
+                    normal,
+                ));
+            }
+            result_card(
+                &mut lines,
+                "Technical details",
+                &details,
+                width,
+                cards,
+                ACCENT,
+            );
+            return lines;
+        }
+        for section in &self.view.sections {
+            let contents: Vec<_> = section
+                .lines
+                .iter()
+                .map(|text| (text.as_str(), Style::default().fg(Color::White)))
+                .collect();
+            result_card(&mut lines, &section.title, &contents, width, cards, ACCENT);
+        }
+        if self.sections_omitted > 0 {
+            result_card(
+                &mut lines,
+                "Additional results",
+                &[("More result sections were omitted from this view.", normal)],
+                width,
+                cards,
+                ACCENT,
+            );
+        }
+        if !self.view.issues.is_empty() {
+            lines.push(Line::styled(
+                "NEXT STEPS",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            for issue in &self.view.issues {
+                let next = if issue.next_step.is_empty() {
+                    "No suggested next step was provided.".to_owned()
+                } else {
+                    format!("Next: {}", issue.next_step)
+                };
+                result_card(
+                    &mut lines,
+                    &issue.heading,
+                    &[
+                        (issue.explanation.as_str(), normal),
+                        (&next, Style::default().fg(Color::White)),
+                    ],
+                    width,
+                    cards,
+                    Color::Yellow,
+                );
+            }
+        }
+        if self.issues_omitted > 0 {
+            result_card(
+                &mut lines,
+                "Additional issues",
+                &[("More issues were omitted from this view.", normal)],
+                width,
+                cards,
+                Color::Yellow,
+            );
+        }
+        if lines.is_empty() {
+            result_card(
+                &mut lines,
+                "Results",
+                &[("No additional result details were provided.", normal)],
+                width,
+                cards,
+                ACCENT,
+            );
+        }
+        lines
+    }
+
+    fn render(&mut self, frame: &mut Frame) {
+        let compact = frame.area().width < 40 || frame.area().height < 12;
+        let areas = if compact {
+            Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(frame.area())
+        } else {
+            Layout::vertical([
+                Constraint::Length(2),
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(2),
+            ])
+            .margin(1)
+            .split(frame.area())
+        };
+        let status = self.view.status;
+        if compact {
+            frame.render_widget(
+                Paragraph::new(status.label()).style(
+                    Style::default()
+                        .fg(status.color())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                areas[0],
+            );
+            frame.render_widget(Paragraph::new(self.view.title.as_str()), areas[1]);
+        } else {
+            frame.render_widget(heading("ePost", &self.view.title), areas[0]);
+            let message = match status {
+                ResultStatus::Success => "Review the results below.",
+                ResultStatus::Attention | ResultStatus::Error => "Review the next steps below.",
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        status.label(),
+                        Style::default()
+                            .fg(status.color())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!(" · {message}")),
+                ]))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Outcome ")
+                        .border_style(Style::default().fg(status.color())),
+                ),
+                areas[1],
+            );
+        }
+        let lines = self.lines(areas[2].width, !compact);
+        let total = lines.len();
+        self.page_height = usize::from(areas[2].height).max(1);
+        self.max_scroll = total.saturating_sub(self.page_height);
+        self.scroll = self.scroll.min(self.max_scroll);
+        // Skip owned lines rather than converting a potentially large scroll
+        // offset to u16. The content and all vector dimensions are bounded.
+        frame.render_widget(
+            Paragraph::new(lines.into_iter().skip(self.scroll).collect::<Vec<_>>()),
+            areas[2],
+        );
+        let detail_hint = if self.show_details {
+            "d summary"
+        } else {
+            "d details"
+        };
+        let footer = if compact {
+            vec![Line::from(
+                "Enter back · r retry · g Doctor · q quit · d details",
+            )]
+        } else {
+            vec![
+                Line::from(vec![
+                    Span::styled(
+                        " Enter  Back to menu ",
+                        Style::default().fg(Color::Black).bg(ACCENT),
+                    ),
+                    Span::raw("  r Retry   g Doctor   q/Esc Quit"),
+                ]),
+                Line::styled(
+                    format!(
+                        "↑/↓ scroll · PgUp/PgDn page · {detail_hint}     {}–{} of {total}",
+                        self.scroll.saturating_add(1).min(total),
+                        self.scroll.saturating_add(self.page_height).min(total),
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]
+        };
+        frame.render_widget(Paragraph::new(footer), areas[3]);
+    }
+}
+
+/// Bounds both the displayed text and the work spent on an untrusted string.
+/// Whitespace becomes a space; terminal controls and bidi controls are removed.
+fn result_text(text: &str, limit: usize) -> String {
+    if limit == 0 {
+        return String::new();
+    }
+    let mut text = text.chars();
+    let mut output = String::new();
+    let mut length = 0;
+    for character in text.by_ref().take(limit.saturating_mul(8)) {
+        let character = match character {
+            '\n' | '\r' | '\t' => ' ',
+            character if visible_character(character) => character,
+            _ => continue,
+        };
+        output.push(character);
+        length += 1;
+        if length == limit {
+            break;
+        }
+    }
+    if text.next().is_some() {
+        if length == limit {
+            output.pop();
+        }
+        output.push('…');
+    }
+    output
+}
+
+fn result_wrap(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut line_width = 0;
+    for word in text.split_whitespace() {
+        let word_width = Line::from(word).width();
+        let separator = usize::from(!line.is_empty());
+        if line_width + separator + word_width <= width {
+            if separator != 0 {
+                line.push(' ');
+            }
+            line.push_str(word);
+            line_width += separator + word_width;
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+            line_width = 0;
+        }
+        let span = Span::raw(word);
+        for grapheme in span.styled_graphemes(Style::default()) {
+            let grapheme_width = Line::from(grapheme.symbol).width();
+            if line_width + grapheme_width > width && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+                line_width = 0;
+            }
+            if grapheme_width > width {
+                line.push('�');
+                line_width += 1;
+            } else {
+                line.push_str(grapheme.symbol);
+                line_width += grapheme_width;
+            }
+        }
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+fn result_card(
+    output: &mut Vec<Line<'static>>,
+    title: &str,
+    contents: &[(&str, Style)],
+    width: usize,
+    bordered: bool,
+    accent: Color,
+) {
+    let content_width = if bordered {
+        width.saturating_sub(4)
+    } else {
+        width
+    };
+    let title = result_wrap(title, content_width)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let title_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+    let border_style = Style::default().fg(Color::DarkGray);
+    if bordered {
+        let fill = width.saturating_sub(Line::from(title.as_str()).width() + 4);
+        output.push(Line::from(vec![
+            Span::styled("┌ ", border_style),
+            Span::styled(title, title_style),
+            Span::styled(format!(" {}┐", "─".repeat(fill)), border_style),
+        ]));
+    } else {
+        output.push(Line::styled(title, title_style));
+    }
+    for (text, style) in contents {
+        for line in result_wrap(text, content_width) {
+            if bordered {
+                let fill = content_width.saturating_sub(Line::from(line.as_str()).width());
+                output.push(Line::from(vec![
+                    Span::styled("│ ", border_style),
+                    Span::styled(line, *style),
+                    Span::styled(format!("{} │", " ".repeat(fill)), border_style),
+                ]));
+            } else {
+                output.push(Line::styled(line, *style));
+            }
+        }
+    }
+    if bordered {
+        output.push(Line::styled(
+            format!("└{}┘", "─".repeat(width.saturating_sub(2))),
+            border_style,
+        ));
+    }
+    output.push(Line::default());
+}
+
+fn result_loop(
+    view: &ResultView,
+    mut draw: impl FnMut(&mut ResultScreen) -> io::Result<()>,
+    mut events: impl FnMut() -> io::Result<Event>,
+) -> io::Result<ResultAction> {
+    let mut state = ResultScreen::new(view);
+    draw(&mut state)?;
+    loop {
+        if let Some(action) = state.event(events()?) {
+            return Ok(action);
+        }
+        draw(&mut state)?;
+    }
+}
+
+/// Shows a completed operation. It only returns a chosen action; retry and
+/// Doctor workflows remain the caller's responsibility after the guard drops.
+pub(crate) fn result(view: &ResultView) -> Result<ResultAction> {
+    let mut terminal = TerminalGuard::new()?;
+    Ok(result_loop(
+        view,
+        |state| terminal.draw(|frame| state.render(frame)),
+        event::read,
+    )?)
+}
+
 /// Existing onboarding and browse flows keep their policy/validation logic.
 /// Only prompt display and input change. Answers never enter the history.
 #[derive(Default)]
@@ -818,6 +1342,294 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    fn result_fixture(status: ResultStatus) -> ResultView {
+        ResultView {
+            title: "Synthetic inbox check".into(),
+            status,
+            sections: vec![ResultSection {
+                title: "Retrieval".into(),
+                lines: vec![
+                    "Documents found: 7".into(),
+                    "New PDFs saved: 4".into(),
+                    "Already saved: 2".into(),
+                ],
+            }],
+            issues: vec![ResultIssue {
+                heading: "One item requires acceptance".into(),
+                explanation: "This item could not be retrieved before acceptance.".into(),
+                next_step: "Review the item in ePost, then retry when ready.".into(),
+            }],
+            details: vec!["Synthetic redacted diagnostic code: acceptance_required".into()],
+        }
+    }
+
+    fn result_key(state: &mut ResultScreen, code: KeyCode) -> Option<ResultAction> {
+        state.event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+    }
+
+    #[test]
+    fn result_cards_show_counts_issues_next_steps_and_explicit_actions() {
+        let mut state = ResultScreen::new(&result_fixture(ResultStatus::Attention));
+        let rendered = screen(90, 30, |frame| state.render(frame));
+        for text in [
+            "Synthetic inbox check",
+            "Needs attention",
+            "Documents found: 7",
+            "New PDFs saved: 4",
+            "NEXT STEPS",
+            "One item requires acceptance",
+            "Review the item in ePost",
+            "Back to menu",
+            "r Retry",
+            "g Doctor",
+            "q/Esc Quit",
+        ] {
+            assert!(rendered.contains(text), "missing result text: {text}");
+        }
+        assert!(rendered.contains('┌'));
+        assert!(!rendered.contains("acceptance_required"));
+        assert!(!rendered.contains("Healthy"));
+    }
+
+    #[test]
+    fn result_outcomes_are_explicit_and_never_invent_coverage() {
+        for (status, label) in [
+            (ResultStatus::Success, "Completed"),
+            (ResultStatus::Attention, "Needs attention"),
+            (ResultStatus::Error, "Unable to complete"),
+        ] {
+            let mut view = result_fixture(status);
+            view.issues.clear();
+            let mut state = ResultScreen::new(&view);
+            let rendered = screen(80, 24, |frame| state.render(frame));
+            assert!(rendered.contains(label));
+            assert!(!rendered.contains("complete mailbox"));
+            assert!(!rendered.contains("Healthy"));
+        }
+    }
+
+    #[test]
+    fn result_actions_require_plain_pressed_keys_and_never_auto_retry() {
+        for status in [
+            ResultStatus::Success,
+            ResultStatus::Attention,
+            ResultStatus::Error,
+        ] {
+            for (key, action) in [
+                (KeyCode::Enter, ResultAction::Back),
+                (KeyCode::Char('r'), ResultAction::Retry),
+                (KeyCode::Char('g'), ResultAction::Doctor),
+                (KeyCode::Char('q'), ResultAction::Quit),
+                (KeyCode::Esc, ResultAction::Quit),
+            ] {
+                let mut state = ResultScreen::new(&result_fixture(status));
+                assert_eq!(state.event(Event::Resize(80, 24)), None);
+                assert_eq!(state.event(Event::Paste("r".into())), None);
+                assert_eq!(result_key(&mut state, KeyCode::Char('x')), None);
+                assert_eq!(result_key(&mut state, key), Some(action));
+            }
+        }
+        let mut state = ResultScreen::new(&result_fixture(ResultStatus::Attention));
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            assert_eq!(
+                state.event(Event::Key(KeyEvent::new(KeyCode::Char('r'), modifiers))),
+                None
+            );
+        }
+        let mut release = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        assert_eq!(state.event(Event::Key(release)), None);
+        assert_eq!(
+            state.event(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ))),
+            Some(ResultAction::Quit)
+        );
+    }
+
+    #[test]
+    fn result_details_toggle_is_local_and_resets_scroll() {
+        let mut state = ResultScreen::new(&result_fixture(ResultStatus::Attention));
+        let summary = screen(80, 24, |frame| state.render(frame));
+        assert!(!summary.contains("Synthetic redacted diagnostic"));
+        state.scroll = 10;
+        assert_eq!(result_key(&mut state, KeyCode::Char('d')), None);
+        assert!(state.show_details);
+        assert_eq!(state.scroll, 0);
+        let details = screen(80, 24, |frame| state.render(frame));
+        assert!(details.contains("Technical details"));
+        assert!(details.contains("Synthetic redacted diagnostic code"));
+        assert!(!details.contains("Documents found"));
+        assert!(details.contains("d summary"));
+        assert_eq!(result_key(&mut state, KeyCode::Char('d')), None);
+        assert!(!state.show_details);
+        let summary_again = screen(80, 24, |frame| state.render(frame));
+        assert!(summary_again.contains("Documents found"));
+        assert!(!summary_again.contains("acceptance_required"));
+    }
+
+    #[test]
+    fn result_scroll_is_bounded_paged_and_clamped_after_resize() {
+        let mut view = result_fixture(ResultStatus::Attention);
+        view.sections[0].lines = (0..32)
+            .map(|index| format!("Synthetic result row {index:02}"))
+            .collect();
+        let mut state = ResultScreen::new(&view);
+        let first = screen(70, 16, |frame| state.render(frame));
+        assert!(first.contains("Synthetic result row 00"));
+        assert!(!first.contains("Synthetic result row 31"));
+        let page_height = state.page_height;
+        assert_eq!(result_key(&mut state, KeyCode::PageDown), None);
+        assert_eq!(state.scroll, page_height);
+        result_key(&mut state, KeyCode::End);
+        assert_eq!(state.scroll, state.max_scroll);
+        let last = screen(70, 16, |frame| state.render(frame));
+        assert!(last.contains("Review the item in ePost"));
+        for _ in 0..200 {
+            result_key(&mut state, KeyCode::Down);
+        }
+        assert_eq!(state.scroll, state.max_scroll);
+        screen(100, 80, |frame| state.render(frame));
+        assert_eq!(state.scroll, 0);
+        result_key(&mut state, KeyCode::PageUp);
+        result_key(&mut state, KeyCode::Home);
+        assert_eq!(state.scroll, 0);
+    }
+
+    #[test]
+    fn result_input_is_sanitized_and_all_dimensions_are_bounded() {
+        let unsafe_text = format!("Synthetic\n\r\t\x1b\u{202e}\u{2066}{}", "Ä🔐".repeat(800));
+        let view = ResultView {
+            title: unsafe_text.clone(),
+            status: ResultStatus::Error,
+            sections: (0..40)
+                .map(|_| ResultSection {
+                    title: unsafe_text.clone(),
+                    lines: vec![unsafe_text.clone(); 40],
+                })
+                .collect(),
+            issues: (0..40)
+                .map(|_| ResultIssue {
+                    heading: unsafe_text.clone(),
+                    explanation: unsafe_text.clone(),
+                    next_step: unsafe_text.clone(),
+                })
+                .collect(),
+            details: vec![unsafe_text; 200],
+        };
+        let mut state = ResultScreen::new(&view);
+        assert_eq!(state.view.sections.len(), RESULT_SECTION_LIMIT);
+        assert_eq!(state.view.issues.len(), RESULT_ISSUE_LIMIT);
+        assert_eq!(state.view.details.len(), RESULT_DETAIL_LIMIT);
+        assert_eq!(state.sections_omitted, 28);
+        assert_eq!(state.issues_omitted, 28);
+        assert_eq!(state.details_omitted, 100);
+        assert!(state.view.title.chars().count() <= 120);
+        let mut fields = vec![state.view.title.as_str()];
+        for section in &state.view.sections {
+            assert!(section.lines.len() <= RESULT_LINE_LIMIT + 1);
+            assert!(section.title.chars().count() <= 120);
+            fields.push(section.title.as_str());
+            fields.extend(section.lines.iter().map(String::as_str));
+        }
+        for issue in &state.view.issues {
+            assert!(issue.heading.chars().count() <= 120);
+            fields.extend([
+                issue.heading.as_str(),
+                issue.explanation.as_str(),
+                issue.next_step.as_str(),
+            ]);
+        }
+        fields.extend(state.view.details.iter().map(String::as_str));
+        for field in fields {
+            assert!(field.chars().count() <= RESULT_TEXT_LIMIT);
+            assert!(field.chars().all(visible_character));
+            assert!(!field.contains('\u{202e}'));
+            assert!(!field.contains('\u{2066}'));
+        }
+        assert!(result_text(&"\x1b".repeat(100_000), 20).chars().count() <= 20);
+        assert_eq!(result_text("abc", 0), "");
+        for details in [false, true] {
+            state.show_details = details;
+            let rendered = screen(70, 20, |frame| state.render(frame));
+            assert!(!rendered.contains('\x1b'));
+            assert!(!rendered.contains('\u{202e}'));
+        }
+    }
+
+    #[test]
+    fn result_wrap_preserves_words_unicode_and_card_width() {
+        assert_eq!(result_wrap("short words stay", 11), ["short words", "stay"]);
+        assert_eq!(result_wrap("abcdef", 3), ["abc", "def"]);
+        assert_eq!(result_wrap("Ä🔐Ä🔐", 3), ["Ä🔐", "Ä🔐"]);
+        for width in [1, 2, 5, 40, 80] {
+            for line in result_wrap("🔐 synthetic Ä̈ diagnostic", width) {
+                assert!(Line::from(line.as_str()).width() <= width);
+            }
+        }
+        let mut state = ResultScreen::new(&result_fixture(ResultStatus::Attention));
+        for (width, height) in [(0, 0), (1, 1), (5, 2), (20, 8), (40, 12), (80, 24)] {
+            screen(width, height, |frame| state.render(frame));
+            result_key(&mut state, KeyCode::Char('d'));
+            screen(width, height, |frame| state.render(frame));
+            result_key(&mut state, KeyCode::End);
+            screen(width, height, |frame| state.render(frame));
+        }
+    }
+
+    #[test]
+    fn result_loop_returns_only_the_selected_action_and_propagates_display_errors() {
+        let view = result_fixture(ResultStatus::Error);
+        let mut events = VecDeque::from([
+            Event::Resize(80, 24),
+            Event::Paste("r".into()),
+            Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        ]);
+        let mut draws = 0;
+        let action = result_loop(
+            &view,
+            |state| {
+                draws += 1;
+                screen(80, 24, |frame| state.render(frame));
+                Ok(())
+            },
+            || {
+                Ok(events
+                    .pop_front()
+                    .expect("bounded synthetic event sequence"))
+            },
+        )
+        .unwrap();
+        assert_eq!(action, ResultAction::Back);
+        assert_eq!(draws, 4);
+        let mut reads = 0;
+        assert!(
+            result_loop(
+                &view,
+                |_| Err(io::Error::other("synthetic draw failure")),
+                || {
+                    reads += 1;
+                    Ok(Event::Key(KeyEvent::new(
+                        KeyCode::Char('r'),
+                        KeyModifiers::NONE,
+                    )))
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(reads, 0);
+        assert!(
+            result_loop(
+                &view,
+                |_| Ok(()),
+                || Err(io::Error::other("synthetic event failure"))
+            )
+            .is_err()
+        );
     }
 
     #[test]

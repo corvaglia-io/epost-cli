@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use epost_cli::error::Error;
-use epost_cli::paperless::{PaperlessClient, PaperlessOptions, TaskStatus, normalize_url};
+use epost_cli::paperless::{
+    PaperlessClient, PaperlessOptions, TaskFailureCode, TaskStatus, normalize_url,
+};
 use epost_cli::secret::Secret;
 use serde_json::{Value, json};
 use wiremock::matchers::{header, method, path, query_param};
@@ -535,6 +537,117 @@ async fn absent_task_is_pending_but_mismatched_and_ambiguous_tasks_are_errors() 
             client(&server).task(TASK_ID).await,
             Err(Error::InvalidResponse(_))
         ));
+    }
+}
+
+#[tokio::test]
+async fn failed_task_results_become_only_fixed_codes_and_safe_document_references() {
+    for (fields, expected_code, expected_id) in [
+        (
+            json!({"related_document":"42", "result":"private synthetic title fake-secret"}),
+            TaskFailureCode::Duplicate,
+            Some(42),
+        ),
+        (
+            json!({"related_document":null,"result":"synthetic.pdf: Not consuming synthetic.pdf: It is a duplicate of private synthetic title fake-secret (#42)."}),
+            TaskFailureCode::Duplicate,
+            Some(42),
+        ),
+        (
+            json!({"result":"Not consuming: It is a duplicate of document #73"}),
+            TaskFailureCode::Duplicate,
+            Some(73),
+        ),
+        (
+            json!({"related_document_ids":[73],"result_data":{"duplicate_of":73,"error_message":"private synthetic title fake-secret"}}),
+            TaskFailureCode::Duplicate,
+            Some(73),
+        ),
+        (
+            json!({"related_document_ids":[73],"result_data":{"duplicate_of":73,"duplicate_in_trash":true}}),
+            TaskFailureCode::Duplicate,
+            None,
+        ),
+        (
+            json!({"result":"private synthetic title fake-secret: Unsupported mime type application/example"}),
+            TaskFailureCode::Unsupported,
+            None,
+        ),
+        (
+            json!({"result_data":{"error_type":"EncryptedPdfError","error_message":"private synthetic title fake-secret"}}),
+            TaskFailureCode::ProtectedPdf,
+            None,
+        ),
+        (
+            json!({"result":"private synthetic title fake-secret: unknown processor failed"}),
+            TaskFailureCode::ProcessingFailure,
+            None,
+        ),
+    ] {
+        let server = MockServer::start().await;
+        let mut entry = json!({"task_id":TASK_ID,"status":"FAILURE"});
+        entry
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        Mock::given(method("GET"))
+            .and(path("/api/tasks/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![entry]))
+            .mount(&server)
+            .await;
+        let task = client(&server).task(TASK_ID).await.unwrap().unwrap();
+        assert_eq!(task.failure_code, Some(expected_code));
+        assert_eq!(task.document_id, expected_id);
+        let diagnostic = format!("{task:?}");
+        for private in ["private synthetic title", "fake-secret", "synthetic.pdf"] {
+            assert!(!diagnostic.contains(private));
+        }
+    }
+}
+
+#[tokio::test]
+async fn duplicate_result_fallback_rejects_unanchored_ambiguous_or_invalid_references() {
+    for result in [
+        "unrelated error: It is a duplicate of private synthetic title (#42).",
+        "Not consuming: It is a duplicate of document #0",
+        "Not consuming: It is a duplicate of document #-42",
+        "Not consuming: It is a duplicate of document #42 and #73",
+        "Not consuming: It is a duplicate of document #999999999999999999999999999",
+        "synthetic.pdf: Not consuming different.pdf: It is a duplicate of title (#42).",
+        "synthetic.pdf: Not consuming synthetic.pdf: It is a duplicate of title (#42) (#73).",
+        "synthetic.pdf: Not consuming synthetic.pdf: It is a duplicate of title (#42).\nprivate content",
+        "synthetic.pdf: Not consuming synthetic.pdf: It is a duplicate of title (#42). Note: existing document is in the trash.",
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tasks/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"task_id":TASK_ID,"status":"FAILURE","result":result}
+            ])))
+            .mount(&server)
+            .await;
+        let task = client(&server).task(TASK_ID).await.unwrap().unwrap();
+        assert_eq!(task.document_id, None);
+        assert_eq!(task.failure_code, Some(TaskFailureCode::ProcessingFailure));
+    }
+    for fields in [
+        json!({"related_document":42,"result":"Not consuming: It is a duplicate of document #73"}),
+        json!({"related_document_ids":[42],"result_data":{"duplicate_of":73}}),
+    ] {
+        let server = MockServer::start().await;
+        let mut entry = json!({"task_id":TASK_ID,"status":"FAILURE"});
+        entry
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        Mock::given(method("GET"))
+            .and(path("/api/tasks/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![entry]))
+            .mount(&server)
+            .await;
+        let error = client(&server).task(TASK_ID).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidResponse(_)));
+        assert!(!error.to_string().contains("#42"));
     }
 }
 

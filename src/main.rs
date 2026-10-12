@@ -20,6 +20,7 @@ mod interactive;
 mod interactive_tests;
 mod modern;
 mod paperless_cli;
+mod presentation;
 mod tui;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -48,6 +49,9 @@ struct Cli {
     /// Compact, structured JSON on stdout; diagnostics stay on stderr.
     #[arg(long, global = true)]
     json: bool,
+    /// Include technical explanations in the text summary.
+    #[arg(long, global = true)]
+    details: bool,
     /// API environment (production unless a selected profile supplies it).
     #[arg(long, global = true, value_enum)]
     environment: Option<Environment>,
@@ -102,6 +106,8 @@ enum Command {
     Deliver(modern::DeliveryArgs),
     /// Audit local files and destination copies.
     Verify(modern::DeliveryArgs),
+    /// Confirm an explicitly selected existing Paperless original without re-uploading.
+    Reconcile(modern::ReconcileArgs),
     /// Diagnose credentials, local storage, DNS/TLS and destination access.
     Doctor(doctor::DoctorArgs),
     /// Configure named delivery destinations; all are used by default.
@@ -1245,6 +1251,7 @@ async fn run(cli: &Cli) -> Result<(Value, u8)> {
         | Command::Status(_)
         | Command::Deliver(_)
         | Command::Verify(_)
+        | Command::Reconcile(_)
         | Command::Profile { .. } => return modern::run(cli).await,
         Command::Destination { command } => return destination_cli::run(cli, command).await,
         Command::Doctor(args) => return doctor::run(cli, args).await,
@@ -1314,6 +1321,7 @@ async fn run(cli: &Cli) -> Result<(Value, u8)> {
         | Command::Status(_)
         | Command::Deliver(_)
         | Command::Verify(_)
+        | Command::Reconcile(_)
         | Command::Profile { .. }
         | Command::Destination { .. }
         | Command::Doctor(_)
@@ -1497,6 +1505,29 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn execute(cli: &mut Cli) -> Result<u8> {
+    let (data, code) = execute_report(cli).await?;
+    if let Some(data) = data {
+        if cli.json {
+            writeln!(
+                io::stdout().lock(),
+                "{}",
+                json!({"schema_version":1,"status":if code==0{"ok"}else{"partial"},"data":data})
+            )?;
+        } else {
+            let lines = if cli.details {
+                human_summary(cli, &data, code)
+            } else {
+                presentation::text(&presentation::report(cli, &data, code))
+            };
+            for line in lines {
+                writeln!(io::stdout().lock(), "{}", interactive::safe_line(&line))?;
+            }
+        }
+    }
+    Ok(code)
+}
+
+async fn execute_report(cli: &mut Cli) -> Result<(Option<Value>, u8)> {
     if matches!(
         cli.command,
         Command::Setup { .. } | Command::Browse { .. } | Command::Login { .. }
@@ -1511,11 +1542,12 @@ async fn execute(cli: &mut Cli) -> Result<u8> {
                 "setup and browse use password sign-in; unset bearer/API-key variables or use the script commands",
             ));
         }
-        return if tui::available() {
+        let code = if tui::available() {
             interactive::run(cli, &mut tui::TuiPrompts::new()?).await
         } else {
             interactive::run(cli, &mut interactive::Terminal::new()?).await
-        };
+        }?;
+        return Ok((None, code));
     }
     let live = !cli.json
         && !cli.no_progress
@@ -1548,9 +1580,7 @@ async fn execute(cli: &mut Cli) -> Result<u8> {
             let credentials = tui::TuiPrompts::new()?.credentials(cli);
             match credentials {
                 Ok(value) => cli.prepared_credentials = Some(value),
-                Err(error) if matches!(cli.command, Command::Check(_)) => {
-                    eprintln!("ePost sign-in: {error}");
-                }
+                Err(_) if matches!(cli.command, Command::Check(_)) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -1561,6 +1591,7 @@ async fn execute(cli: &mut Cli) -> Result<u8> {
             Command::Deliver(args) | Command::Verify(args) => {
                 Some((args.destinations.clone(), args.output.clone()))
             }
+            Command::Reconcile(args) => Some((vec![args.destination.clone()], args.output.clone())),
             _ => None,
         };
         if let Some((names, path)) = prepare {
@@ -1589,18 +1620,7 @@ async fn execute(cli: &mut Cli) -> Result<u8> {
         run(cli).await
     };
     let (data, code) = result?;
-    if cli.json {
-        writeln!(
-            io::stdout().lock(),
-            "{}",
-            json!({"schema_version":1,"status":if code==0{"ok"}else{"partial"},"data":data})
-        )?;
-    } else {
-        for line in human_summary(cli, &data, code) {
-            writeln!(io::stdout().lock(), "{line}")?;
-        }
-    }
-    Ok(code)
+    Ok((Some(data), code))
 }
 
 fn human_summary(cli: &Cli, data: &Value, code: u8) -> Vec<String> {
@@ -1609,6 +1629,7 @@ fn human_summary(cli: &Cli, data: &Value, code: u8) -> Vec<String> {
         | Command::Status(_)
         | Command::Deliver(_)
         | Command::Verify(_)
+        | Command::Reconcile(_)
         | Command::Profile { .. } => modern::summary(data, code),
         Command::Doctor(_) => doctor::summary(data),
         Command::Destination { .. } => destination_cli::summary(data),
@@ -1820,23 +1841,62 @@ async fn menu(base: &Cli) -> Result<u8> {
                 }
             }
         };
-        match execute(&mut cli).await {
-            Ok(code) => last = code,
-            Err(error) => {
-                last = error.exit_code();
-                eprintln!("{error}");
+        loop {
+            // Never carry an operation's cached credentials into a retry or Doctor.
+            cli.non_interactive = base.non_interactive;
+            cli.prepared_credentials = None;
+            cli.prepared_paperless_token = None;
+            cli.prepared_destination_tokens.clear();
+            cli.prepared_destination_failures.clear();
+            let view = match execute_report(&mut cli).await {
+                Ok((data, code)) => {
+                    last = code;
+                    if code == 0
+                        && let Command::Profile {
+                            command: modern::ProfileCommand::Use { name },
+                        } = &cli.command
+                    {
+                        current.profile = Some(name.clone());
+                    }
+                    data.map(|data| presentation::report(&cli, &data, code))
+                        .unwrap_or_else(|| {
+                            presentation::report(&cli, &json!({"status":"session ended"}), code)
+                        })
+                }
+                Err(error) => {
+                    last = error.exit_code();
+                    presentation::error(&cli, &error)
+                }
+            };
+            let action = if tui::available() {
+                tui::result(&view)?
+            } else {
+                for line in presentation::text(&view) {
+                    writeln!(io::stdout().lock(), "{line}")?;
+                }
+                use interactive::Prompts;
+                match interactive::Terminal::new()?
+                    .input("Enter menu · r retry · g Doctor · q quit: ")?
+                    .as_deref()
+                {
+                    Some("r") => tui::ResultAction::Retry,
+                    Some("g") => tui::ResultAction::Doctor,
+                    None => tui::ResultAction::Quit,
+                    _ => tui::ResultAction::Back,
+                }
+            };
+            match action {
+                tui::ResultAction::Back => break,
+                tui::ResultAction::Quit => return Ok(last),
+                tui::ResultAction::Retry => {}
+                tui::ResultAction::Doctor => {
+                    cli.command = Command::Doctor(doctor::DoctorArgs {
+                        destinations: Vec::new(),
+                        offline: false,
+                    });
+                }
             }
         }
-        if last == 0
-            && let Command::Profile {
-                command: modern::ProfileCommand::Use { name },
-            } = &cli.command
-        {
-            current.profile = Some(name.clone());
-        }
-        use interactive::Prompts;
-        let _ =
-            interactive::Terminal::new()?.input("Enter returns to the menu (q also returns): ")?;
     }
 }
 

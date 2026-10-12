@@ -1,18 +1,26 @@
-## epost-cli v0.2.0
+# v0.2.1
 
-Run `epost` for the Ratatui menu, or `epost check inbox` to retrieve eligible unsaved mail and resume delivery to every configured destination using the saved default profile.
+The menu now keeps a readable result screen after progress finishes, with
+separate source/destination counts, grouped issues and explicit next steps.
+Enter returns to the menu, `r` retries, `g` runs Doctor, `d` toggles details,
+and `q`/Esc quits. Standalone commands keep compact text; `--details` expands
+technical diagnostics and `--json` retains structured reports.
 
-- Guided setup, explicit mailbox selection, default profiles and optional local macOS Keychain credentials.
-- Live terminal progress and lasting text summaries; `--json` and `--non-interactive` support automation.
-- Multiple named Paperless-ngx and verified folder destinations, with independent delivery history and failure isolation. `--destination NAME` restricts one run.
-- Resumable ingestion, original-byte verification and `epost verify`, which audits existing copies without submitting new PDFs. Pending delivery resumes even when the inbox is quiet.
-- Custom inbox/source/extra tags and optional document-type or Text provenance mappings. Received time is preserved separately from document issue date; missing metadata is omitted.
-- Read-only `epost doctor` diagnostics for storage, unattended credentials, source access and DNS/TLS/proxy routing. Access redirects are probed before loading a Paperless token.
-- Legacy profile, Keychain and Paperless history migration, including safe restoration of removed legacy destinations without losing their binding.
-- Read-only inbox/archive retrieval, bounded requests, atomic storage, repeat-run integrity checks and actionable public-API download errors.
+Paperless duplicate failures are recognized separately from uncertain uploads.
+A referenced existing original is adopted only after byte-count and SHA-256
+verification. Its tags, type and reviewed state are preserved. Failed tasks
+from older journals are rechecked without re-uploading. Unknown, conflicting
+or mismatching results remain attention with a specific recovery action.
+`epost reconcile DESTINATION LETTER_ID --document-id ID` supports explicit
+original-byte verification against a manually selected existing document.
 
-Both `epost` and `epost-cli` are included. Existing profiles are reused; use `epost profile use NAME` if multiple accounts have no default. See [daily commands and migration](https://github.com/corvaglia-io/epost-cli/blob/v0.2.0/docs/commands.md) and [Paperless setup](https://github.com/corvaglia-io/epost-cli/blob/v0.2.0/docs/paperless.md).
+New Paperless setup proposes separate `epost` and `inbox` tags. Existing tag IDs
+and credential/history bindings are preserved. The setup guide explains optional
+document types, Auto matching and removal of inbox tags after human review.
+Source Status counts remain visible alongside destination history, and cached
+non-PDF files are counted separately from reused PDFs.
 
-All ePost mail operations remain read-only: downloading or delivering does not mark mail read, accept registered letters, move/archive mail, or act on document contents. Website download fallback is not implemented. This project is unofficial and offers no guarantee of provider availability, compatibility or complete mailbox coverage. Development and CI use synthetic data; native Keychain and live provider behavior still require operator testing.
-
-Download the archive matching your operating system and CPU, verify it with `SHA256SUMS`, then extract it. Linux builds use glibc on Ubuntu 22.04 and are not static/musl builds. macOS builds are unsigned and not notarized. No Windows binary, container image or crates.io package is published. Each archive contains both executables, README.md and the MIT LICENSE.
+Validation uses synthetic localhost APIs and fake credentials only. Provider
+compatibility and complete mailbox coverage remain unverified. The documented
+ePost content-404/manual-download limitation remains visible; browser fallback
+is still a future improvement. No ePost mailbox mutation is introduced.

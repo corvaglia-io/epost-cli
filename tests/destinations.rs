@@ -601,6 +601,136 @@ async fn named_uncertain_post_and_pending_task_never_repost() {
 }
 
 #[tokio::test]
+async fn named_explicit_reconciliation_preserves_reviewed_existing_metadata_after_byte_proof() {
+    let fixture = Fixture::new();
+    let mut store = fixture.store("synthetic");
+    seed(&mut store);
+    let server = MockServer::start().await;
+    let client = make_client(&server);
+    let mut destination = paperless(&client, "reviewed");
+    let DestinationKind::Paperless(config) = &mut destination.kind else {
+        unreachable!()
+    };
+    config.extra_tag_ids = vec![13];
+    // The existing PDF has been reviewed: no inbox/source/extra tags are
+    // required, fetched or changed by this explicit adoption.
+    Mock::given(method("GET"))
+        .and(path("/api/documents/42/download/"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(pdf()))
+        .mount(&server)
+        .await;
+    let report = delivery::reconcile_paperless(&mut store, &client, &destination, LETTER, 42)
+        .await
+        .unwrap();
+    assert_eq!(
+        report.status,
+        delivery::DeliveryItemStatus::AlreadyDelivered
+    );
+    assert_eq!(report.document_id, Some(42));
+    let name = destinations::ledger_name(&destination);
+    let ledger: Value =
+        serde_json::from_slice(&store.read_private_state(&name).unwrap().unwrap()).unwrap();
+    let records = ledger["entries"].as_object().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records.values().next().unwrap()["state"]["provenance"],
+        "existing_document"
+    );
+    assert!(
+        store
+            .read_private_state("paperless-delivery.json")
+            .unwrap()
+            .is_none()
+    );
+    let repeated = delivery::reconcile_paperless(&mut store, &client, &destination, LETTER, 42)
+        .await
+        .unwrap();
+    assert_eq!(
+        repeated.status,
+        delivery::DeliveryItemStatus::AlreadyDelivered
+    );
+    let cached = delivery::deliver_paperless(
+        &mut store,
+        &client,
+        &destination,
+        named_options(false),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(cached.previously_confirmed, 1);
+    let audit = delivery::verify_paperless(&mut store, &client, &destination, options(), |_| {})
+        .await
+        .unwrap();
+    assert_eq!(audit.already_delivered, 1);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.method.as_str() == "GET"
+                && request.url.path() == "/api/documents/42/download/")
+    );
+}
+
+#[tokio::test]
+async fn named_explicit_reconciliation_rejects_wrong_bytes_unknown_letters_and_cross_destination_ids()
+ {
+    let fixture = Fixture::new();
+    let mut store = fixture.store("synthetic");
+    seed(&mut store);
+    let server = MockServer::start().await;
+    let client = make_client(&server);
+    let destination = paperless(&client, "explicit");
+    let mut wrong_bytes = pdf();
+    wrong_bytes[12] ^= 1;
+    Mock::given(method("GET"))
+        .and(path("/api/documents/73/download/"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(wrong_bytes))
+        .mount(&server)
+        .await;
+    for (letter, id) in [(LETTER, 73), ("unknown-synthetic-letter", 73), (LETTER, 0)] {
+        assert!(
+            delivery::reconcile_paperless(&mut store, &client, &destination, letter, id)
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        store
+            .read_private_state(&destinations::ledger_name(&destination))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    Mock::given(method("GET"))
+        .and(path("/api/documents/42/download/"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(pdf()))
+        .mount(&server)
+        .await;
+    delivery::reconcile_paperless(&mut store, &client, &destination, LETTER, 42)
+        .await
+        .unwrap();
+    assert!(
+        delivery::reconcile_paperless(&mut store, &client, &destination, LETTER, 73)
+            .await
+            .is_err()
+    );
+    let mut other_instance = destination.clone();
+    let DestinationKind::Paperless(config) = &mut other_instance.kind else {
+        unreachable!()
+    };
+    config.target.url = "https://synthetic-paperless.invalid/".into();
+    assert!(
+        delivery::reconcile_paperless(&mut store, &client, &other_instance, LETTER, 42)
+            .await
+            .is_err()
+    );
+    // The binding and already verified ID are checked before remote requests.
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn custom_fields_must_be_text_and_validation_does_not_record_upload_intent() {
     let fixture = Fixture::new();
     let mut store = fixture.store("synthetic");

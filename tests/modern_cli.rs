@@ -91,12 +91,16 @@ impl Fixture {
         Store::open(&self.root, &self.namespace).unwrap()
     }
     fn command(&self, source: &MockServer) -> Command {
+        let mut command = self.text_command(source);
+        command.arg("--json");
+        command
+    }
+    fn text_command(&self, source: &MockServer) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_epost-cli"));
         command
             .env_clear()
             .stdin(Stdio::null())
             .args([
-                "--json",
                 "--no-progress",
                 "--non-interactive",
                 "--timeout-seconds",
@@ -608,6 +612,160 @@ async fn local_profile_destination_delivery_and_verify_commands_do_not_authentic
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_adopts_only_the_named_matching_reviewed_original_without_source_login() {
+    let source = MockServer::start().await;
+    let remote = MockServer::start().await;
+    let unselected_remote = MockServer::start().await;
+    let fixture = Fixture::with_login(&source, LoginMethod::MacosKeychain);
+    let mut store = fixture.store();
+    store
+        .save(LETTER, "inbox", PDF, Some("application/pdf"))
+        .unwrap();
+    let selected = fixture.paperless(&mut store, "chosen", &remote);
+    let mut unselected = fixture.paperless(&mut store, "unselected", &unselected_remote);
+    let DestinationKind::Paperless(config) = &mut unselected.kind else {
+        unreachable!()
+    };
+    config.target.remember_token = true;
+    destinations::save(&mut store, &unselected).unwrap();
+    fixture.folder(&mut store, "unselected-folder");
+    drop(store);
+    Mock::given(method("GET"))
+        .and(path("/api/documents/41/download/"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(PDF))
+        .mount(&remote)
+        .await;
+    // This existing document has already left the review queue. Adoption must
+    // require its original bytes only and preserve this document's metadata.
+    Mock::given(method("GET"))
+        .and(path("/api/documents/41/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":41,"tags":[12]})))
+        .mount(&remote)
+        .await;
+    for _ in 0..2 {
+        let mut command = fixture.command(&source);
+        named_token(&mut command, "chosen");
+        let data = report(
+            command
+                .args(["reconcile", "chosen", LETTER, "--document-id", "41"])
+                .output()
+                .unwrap(),
+            0,
+        );
+        assert_eq!(data["reconciled"], true);
+        assert_eq!(data["destinations"].as_array().unwrap().len(), 1);
+        let delivery = &destination(&data, "chosen")["delivery"];
+        assert_eq!(delivery["delivered"], 0);
+        assert_eq!(delivery["already_delivered"], 1);
+        assert_eq!(delivery["items"][0]["document_id"], 41);
+        assert_eq!(delivery["items"][0]["status"], "already_delivered");
+    }
+    let store = fixture.store();
+    assert_eq!(
+        delivery::destination_status(&store, &selected)
+            .unwrap()
+            .verified,
+        1
+    );
+    assert_eq!(
+        delivery::destination_status(&store, &unselected)
+            .unwrap()
+            .not_submitted,
+        1
+    );
+    let ledger: Value = serde_json::from_slice(
+        &store
+            .read_private_state(&destinations::ledger_name(&selected))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        ledger["entries"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()["state"]["provenance"],
+        "existing_document"
+    );
+    assert!(!fixture.base.join("unselected-folder").exists());
+    assert!(source.received_requests().await.unwrap().is_empty());
+    assert!(
+        unselected_remote
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let requests = remote.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert_eq!(request.method.as_str(), "GET");
+        assert_eq!(request.url.path(), "/api/documents/41/download/");
+        assert_eq!(
+            request.headers.get("authorization").unwrap(),
+            &format!("Token {DESTINATION_TOKEN}")
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_rejects_original_hash_or_length_mismatch_without_remote_writes() {
+    let source = MockServer::start().await;
+    let remote = MockServer::start().await;
+    let mut same_length = PDF.to_vec();
+    same_length[10] = b'X';
+    let mut different_length = PDF.to_vec();
+    different_length.push(b'\n');
+    for original in [same_length, different_length] {
+        let fixture = Fixture::with_login(&source, LoginMethod::MacosKeychain);
+        let mut store = fixture.store();
+        store
+            .save(LETTER, "inbox", PDF, Some("application/pdf"))
+            .unwrap();
+        let selected = fixture.paperless(&mut store, "chosen", &remote);
+        drop(store);
+        remote.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/api/documents/41/download/"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(original))
+            .mount(&remote)
+            .await;
+        let mut command = fixture.command(&source);
+        named_token(&mut command, "chosen");
+        let output = command
+            .args(["reconcile", "chosen", LETTER, "--document-id", "41"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let diagnostic: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(diagnostic["status"], "error");
+        assert!(
+            diagnostic["error"]
+                .as_str()
+                .unwrap()
+                .contains("original does not match")
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(DESTINATION_TOKEN));
+        let store = fixture.store();
+        assert_eq!(store.read_saved(LETTER).unwrap(), PDF);
+        assert!(
+            store
+                .read_private_state(&destinations::ledger_name(&selected))
+                .unwrap()
+                .is_none()
+        );
+        let requests = remote.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method.as_str(), "GET");
+        assert_eq!(requests[0].url.path(), "/api/documents/41/download/");
+        assert!(source.received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn source_authentication_failure_still_delivers_saved_pdf_to_folder() {
     let source = MockServer::start().await;
     let fixture = Fixture::new(&source);
@@ -655,6 +813,79 @@ async fn status_inbox_inspects_metadata_and_local_delivery_state_without_downloa
     assert_eq!(data["destinations"][0]["state"]["saved_documents"], 0);
     assert_eq!(source.received_requests().await.unwrap().len(), 1);
     assert!(fixture.store().saved_documents().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_status_retains_source_counts_and_incomplete_read_state_alongside_destinations() {
+    let source = MockServer::start().await;
+    let fixture = Fixture::new(&source);
+    let mut store = fixture.store();
+    store
+        .save(LETTER, "inbox", PDF, Some("application/pdf"))
+        .unwrap();
+    fixture.folder(&mut store, "copies");
+    drop(store);
+    inbox(
+        &source,
+        json!([
+            {"id":LETTER,"readStatus":"READ"},
+            {"id":"synthetic-unknown-read-status"}
+        ]),
+    )
+    .await;
+    let compact = fixture
+        .text_command(&source)
+        .env("EPOST_BEARER_TOKEN", BEARER)
+        .args(["status", "inbox"])
+        .output()
+        .unwrap();
+    assert_eq!(compact.status.code(), Some(2));
+    assert!(compact.stderr.is_empty());
+    let text = String::from_utf8(compact.stdout).unwrap();
+    for expected in [
+        "Inbox:",
+        "0 unread observed",
+        "1 unsaved · 1 already saved",
+        "Inbox status incomplete",
+        "copies:",
+        "Local history only",
+    ] {
+        assert!(
+            text.contains(expected),
+            "missing compact source status: {expected}"
+        );
+    }
+    assert!(!text.contains("No unread or unsaved"));
+    assert!(!text.contains(BEARER));
+    assert!(!text.contains('\u{1b}'));
+    let detailed = fixture
+        .text_command(&source)
+        .env("EPOST_BEARER_TOKEN", BEARER)
+        .args(["status", "inbox", "--details"])
+        .output()
+        .unwrap();
+    assert_eq!(detailed.status.code(), Some(2));
+    assert!(detailed.stderr.is_empty());
+    let text = String::from_utf8(detailed.stdout).unwrap();
+    assert!(text.contains("1 with unknown read status"));
+    assert!(text.contains("Counts are observations; mailbox coverage is unverified"));
+    let data = report(
+        fixture
+            .authenticated(&source)
+            .args(["status", "inbox"])
+            .output()
+            .unwrap(),
+        2,
+    );
+    assert_eq!(data["inbox"]["has_unread"], Value::Null);
+    assert_eq!(data["inbox"]["unknown_read_status_count"], 1);
+    assert_eq!(data["inbox"]["new_documents_count"], 1);
+    assert_eq!(data["inbox"]["already_saved_count"], 1);
+    let requests = source.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests.iter().all(|request| {
+        request.method.as_str() == "GET" && request.url.path() == "/epost/v2/letters"
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

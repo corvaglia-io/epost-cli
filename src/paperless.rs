@@ -53,11 +53,23 @@ pub enum TaskStatus {
     Failure,
 }
 
+/// Fixed diagnostics only; authenticated task results can contain document
+/// titles, filenames, paths and secrets and must never escape the parser.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskFailureCode {
+    Duplicate,
+    ProtectedPdf,
+    Unsupported,
+    ProcessingFailure,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Task {
     pub task_id: String,
     pub status: TaskStatus,
     pub document_id: Option<i64>,
+    pub failure_code: Option<TaskFailureCode>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -872,13 +884,14 @@ fn parse_task(value: Value, expected_task_id: &str) -> Result<Task> {
         .get("status")
         .and_then(Value::as_str)
         .ok_or(Error::InvalidResponse("invalid Paperless task status"))?;
+    let reported_failure = status.eq_ignore_ascii_case("FAILURE");
     let status = match status.to_ascii_uppercase().as_str() {
         "PENDING" | "STARTED" | "RETRY" => TaskStatus::Pending,
         "SUCCESS" => TaskStatus::Success,
         "FAILURE" | "REVOKED" => TaskStatus::Failure,
         _ => return Err(Error::InvalidResponse("unsupported Paperless task status")),
     };
-    let document_id = match value.get("related_document_ids") {
+    let mut document_id = match value.get("related_document_ids") {
         Some(Value::Array(ids)) if ids.is_empty() => None,
         Some(Value::Array(ids)) if ids.len() == 1 => Some(positive_id(ids.first())?),
         Some(_) => {
@@ -891,11 +904,131 @@ fn parse_task(value: Value, expected_task_id: &str) -> Result<Task> {
             value => Some(positive_id(value)?),
         },
     };
+    let failure_code = if status == TaskStatus::Failure {
+        let (code, duplicate_id) = if reported_failure {
+            classify_task_failure(&value)
+        } else {
+            (TaskFailureCode::ProcessingFailure, None)
+        };
+        if let Some(duplicate_id) = duplicate_id {
+            if document_id.is_some_and(|id| id != duplicate_id) {
+                return Err(Error::InvalidResponse(
+                    "conflicting Paperless task document IDs",
+                ));
+            }
+            document_id = Some(duplicate_id);
+        }
+        if value
+            .get("result_data")
+            .and_then(|data| data.get("duplicate_in_trash"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            document_id = None;
+        }
+        // Legacy serializers expose related_document on FAILURE only for a
+        // duplicate, including versions whose result formatter is unfamiliar.
+        Some(
+            if reported_failure
+                && document_id.is_some()
+                && value.get("related_document_ids").is_none()
+                && value.get("result_data").is_none()
+            {
+                TaskFailureCode::Duplicate
+            } else {
+                code
+            },
+        )
+    } else {
+        None
+    };
     Ok(Task {
         task_id: task_id.to_owned(),
         status,
         document_id,
+        failure_code,
     })
+}
+
+fn classify_task_failure(value: &Value) -> (TaskFailureCode, Option<i64>) {
+    let data = value.get("result_data");
+    if let Some(id) = data
+        .and_then(|data| data.get("duplicate_of"))
+        .and_then(Value::as_i64)
+        .filter(|id| *id > 0)
+    {
+        let in_trash = data
+            .and_then(|data| data.get("duplicate_in_trash"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        return (TaskFailureCode::Duplicate, (!in_trash).then_some(id));
+    }
+    let result = value
+        .get("result")
+        .and_then(Value::as_str)
+        .or_else(|| data?.get("error_message")?.as_str());
+    if let Some(result) =
+        result.filter(|text| text.len() <= 8192 && !text.chars().any(char::is_control))
+    {
+        if let Some(id) = duplicate_result_id(result) {
+            return (TaskFailureCode::Duplicate, Some(id));
+        }
+        // These are fixed parser/consumer markers from Paperless, not arbitrary
+        // document IDs or text copied into a report. Unknown results stay generic.
+        let parser_error = result
+            .split_once(": Error occurred while consuming document ")
+            .and_then(|(filename, message)| message.strip_prefix(filename))
+            .and_then(|message| message.strip_prefix(": "))
+            .unwrap_or(result);
+        if parser_error.starts_with("EncryptedPdfError:")
+            || parser_error.starts_with("DigitalSignatureError:")
+        {
+            return (TaskFailureCode::ProtectedPdf, None);
+        }
+        if result.starts_with("Unsupported mime type ")
+            || result
+                .split_once(": ")
+                .is_some_and(|(_, message)| message.starts_with("Unsupported mime type "))
+        {
+            return (TaskFailureCode::Unsupported, None);
+        }
+    }
+    if data
+        .and_then(|data| data.get("error_type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "EncryptedPdfError" | "DigitalSignatureError"))
+    {
+        return (TaskFailureCode::ProtectedPdf, None);
+    }
+    (TaskFailureCode::ProcessingFailure, None)
+}
+
+/// Accept only complete known result formats. Never search arbitrary text for
+/// an ID: duplicate titles themselves may contain misleading document numbers.
+fn duplicate_result_id(result: &str) -> Option<i64> {
+    if let Some(id) = result.strip_prefix("Not consuming: It is a duplicate of document #") {
+        return strict_positive_id(id);
+    }
+    let (filename, message) = result.split_once(": Not consuming ")?;
+    if filename.is_empty() || filename.len() > 255 {
+        return None;
+    }
+    let duplicate = message
+        .strip_prefix(filename)?
+        .strip_prefix(": It is a duplicate of ")?;
+    let duplicate = duplicate.strip_suffix(").")?;
+    let (label, id) = duplicate.rsplit_once(" (#")?;
+    if label.is_empty() || label.contains(" (#") {
+        return None;
+    }
+    strict_positive_id(id)
+}
+
+fn strict_positive_id(value: &str) -> Option<i64> {
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse::<i64>().ok())
+        .flatten()
+        .filter(|id| *id > 0)
 }
 
 fn backoff(attempt: u32) -> Duration {

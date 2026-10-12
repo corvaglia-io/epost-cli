@@ -520,7 +520,8 @@ async fn non_tty_delivery_has_plain_live_progress_and_a_lasting_human_summary() 
     let summary = String::from_utf8(output.stdout).unwrap();
     assert!(progress.contains("starting"));
     assert!(progress.contains("finished"));
-    assert!(summary.contains("copies: 1 newly verified"));
+    assert!(summary.contains("copies:"));
+    assert!(summary.contains("1 confirmed: 1 new"));
     assert!(!progress.contains('\x1b'));
     assert!(!summary.contains('\x1b'));
     assert!(epost.received_requests().await.unwrap().is_empty());
