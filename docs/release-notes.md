@@ -1,10 +1,18 @@
-Initial development release of the unofficial epost-cli Rust CLI and library.
+## epost-cli v0.2.0
 
-- Read-only inbox and archive metadata/document retrieval.
-- Explicit private/business mailbox selection, password/bearer authentication and business API keys.
-- In-session token refresh, bounded pagination/retries and JSON reports with nonzero failure exits.
-- Atomic local storage with mailbox namespaces, hashes, locking and repeat-run verification.
+Run `epost` for the Ratatui menu, or `epost check inbox` to retrieve eligible unsaved mail and resume delivery to every configured destination using the saved default profile.
 
-Development and CI use synthetic data only. Provider compatibility and complete mailbox coverage remain unverified. Registered letters requiring acceptance remain pending; downloading a document does not act on its contents. See the included README for command examples and limitations.
+- Guided setup, explicit mailbox selection, default profiles and optional local macOS Keychain credentials.
+- Live terminal progress and lasting text summaries; `--json` and `--non-interactive` support automation.
+- Multiple named Paperless-ngx and verified folder destinations, with independent delivery history and failure isolation. `--destination NAME` restricts one run.
+- Resumable ingestion, original-byte verification and `epost verify`, which audits existing copies without submitting new PDFs. Pending delivery resumes even when the inbox is quiet.
+- Custom inbox/source/extra tags and optional document-type or Text provenance mappings. Received time is preserved separately from document issue date; missing metadata is omitted.
+- Read-only `epost doctor` diagnostics for storage, unattended credentials, source access and DNS/TLS/proxy routing. Access redirects are probed before loading a Paperless token.
+- Legacy profile, Keychain and Paperless history migration, including safe restoration of removed legacy destinations without losing their binding.
+- Read-only inbox/archive retrieval, bounded requests, atomic storage, repeat-run integrity checks and actionable public-API download errors.
 
-Choose the archive matching your operating system and CPU architecture. Verify it using SHA256SUMS before extracting. Linux binaries use glibc and are built on Ubuntu 22.04; they are not static/musl builds. macOS binaries are unsigned and not notarized. No Windows binary, container image or crates.io package is included. Each archive contains epost-cli, README.md and the MIT LICENSE.
+Both `epost` and `epost-cli` are included. Existing profiles are reused; use `epost profile use NAME` if multiple accounts have no default. See [daily commands and migration](https://github.com/corvaglia-io/epost-cli/blob/v0.2.0/docs/commands.md) and [Paperless setup](https://github.com/corvaglia-io/epost-cli/blob/v0.2.0/docs/paperless.md).
+
+All ePost mail operations remain read-only: downloading or delivering does not mark mail read, accept registered letters, move/archive mail, or act on document contents. Website download fallback is not implemented. This project is unofficial and offers no guarantee of provider availability, compatibility or complete mailbox coverage. Development and CI use synthetic data; native Keychain and live provider behavior still require operator testing.
+
+Download the archive matching your operating system and CPU, verify it with `SHA256SUMS`, then extract it. Linux builds use glibc on Ubuntu 22.04 and are not static/musl builds. macOS builds are unsigned and not notarized. No Windows binary, container image or crates.io package is published. Each archive contains both executables, README.md and the MIT LICENSE.

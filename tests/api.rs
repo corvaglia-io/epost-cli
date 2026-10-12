@@ -220,6 +220,167 @@ async fn private_and_business_inbox_queries_request_all_types() {
 }
 
 #[tokio::test]
+async fn unread_count_uses_exact_read_only_path_without_query_parameters() {
+    for kind in [MailboxKind::Private, MailboxKind::Business] {
+        for count in [0, 7, i32::MAX] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/epost/v2/letters/inbox/count"))
+                .and(header("authorization", "Bearer synthetic-bearer"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(count))
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert_eq!(
+                client(&server, kind).inbox_unread_count().await.unwrap(),
+                count as u32
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].url.path(), "/epost/v2/letters/inbox/count");
+            assert!(requests[0].url.query().is_none());
+            assert!(requests[0].body.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn unread_count_rejects_negative_overflow_noninteger_and_malformed_responses() {
+    for body in [
+        "-1",
+        "2147483648",
+        "4294967295",
+        "-2147483649",
+        "1.5",
+        "1.0",
+        "\"7\"",
+        "null",
+        "[]",
+        "{}",
+        "",
+        "malformed synthetic-bearer synthetic-person@example.invalid",
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/epost/v2/letters/inbox/count"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = client(&server, MailboxKind::Private)
+            .inbox_unread_count()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidResponse(_)), "{body}");
+        assert!(!error.to_string().contains("synthetic-bearer"));
+        assert!(!error.to_string().contains("synthetic-person"));
+        assert!(!format!("{error:?}").contains("synthetic-bearer"));
+    }
+}
+
+#[tokio::test]
+async fn unread_count_authentication_failures_do_not_expose_response_bodies() {
+    for status in [401, 403] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/epost/v2/letters/inbox/count"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_string(
+                    "synthetic-bearer fake-password synthetic-person@example.invalid",
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = client(&server, MailboxKind::Private)
+            .inbox_unread_count()
+            .await
+            .unwrap_err();
+        assert_eq!(error.exit_code(), 3);
+        assert!(matches!(error, Error::Auth | Error::Http(403)));
+        assert!(!error.to_string().contains("synthetic-bearer"));
+        assert!(!error.to_string().contains("fake-password"));
+        assert!(!format!("{error:?}").contains("synthetic-person"));
+    }
+}
+
+#[tokio::test]
+async fn unread_count_requires_a_selected_mailbox_and_authentication_before_network_io() {
+    let server = MockServer::start().await;
+    let mut without_mailbox = ApiClient::for_test(&server.uri(), None, options()).unwrap();
+    assert!(matches!(
+        without_mailbox.inbox_unread_count().await,
+        Err(Error::Config(_))
+    ));
+    let mut without_auth = ApiClient::for_test(
+        &server.uri(),
+        Some(mailbox(MailboxKind::Private)),
+        options(),
+    )
+    .unwrap();
+    assert!(matches!(
+        without_auth.inbox_unread_count().await,
+        Err(Error::Auth)
+    ));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn unread_count_uses_one_controlled_refresh_after_a_401() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let response_calls = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .and(path("/core/latest/token"))
+        .respond_with(move |_: &Request| {
+            let (access, refresh) = match response_calls.fetch_add(1, Ordering::SeqCst) {
+                0 => ("old-count-access", "old-count-refresh"),
+                _ => ("new-count-access", "new-count-refresh"),
+            };
+            ResponseTemplate::new(200).set_body_json(token(access, refresh, 3600))
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/epost/v2/letters/inbox/count"))
+        .and(header("authorization", "Bearer old-count-access"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("old-count-access"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/epost/v2/letters/inbox/count"))
+        .and(header("authorization", "Bearer new-count-access"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(12))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut client = ApiClient::for_test(
+        &server.uri(),
+        Some(mailbox(MailboxKind::Private)),
+        options(),
+    )
+    .unwrap();
+    client
+        .login(
+            "synthetic-person@example.invalid",
+            &Secret::new("fake-password".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(client.inbox_unread_count().await.unwrap(), 12);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(form(&requests[2])["grant_type"], "refresh_token");
+    assert_eq!(form(&requests[2])["refresh_token"], "old-count-refresh");
+    for request in requests.iter().filter(|request| request.method == "GET") {
+        assert_eq!(request.url.path(), "/epost/v2/letters/inbox/count");
+        assert!(request.url.query().is_none());
+    }
+}
+
+#[tokio::test]
 async fn invalid_pagination_is_rejected_before_network_io() {
     let server = MockServer::start().await;
     let mut client = client(&server, MailboxKind::Private);

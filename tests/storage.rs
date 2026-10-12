@@ -1,6 +1,6 @@
 //! Entirely synthetic local filesystem tests; no provider captures or secrets.
 
-use epost_cli::storage::Store;
+use epost_cli::storage::{SaveResult, Store, format_hint};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -116,6 +116,7 @@ fn repeat_runs_verify_and_record_all_inbox_archive_sources() {
     assert_eq!(third.status, "already_saved");
     for result in [&first, &second, &third] {
         assert_eq!(result.content_type.as_deref(), Some("application/pdf"));
+        assert_eq!(result.format_hint.as_deref(), Some("pdf"));
     }
     let manifest = fixture.read_manifest("synthetic-private");
     let entries = manifest["entries"].as_object().unwrap();
@@ -127,6 +128,222 @@ fn repeat_runs_verify_and_record_all_inbox_archive_sources() {
         serde_json::json!(["archive:folder:invented", "archive:root", "inbox"])
     );
     assert_eq!(fs::read(first.path).unwrap(), bytes);
+}
+
+#[test]
+fn saved_membership_lookup_is_read_only_and_validates_identifiers() {
+    let fixture = Fixture::new();
+    let bytes = pdf();
+    let saved = {
+        let mut store = Store::open(&fixture.root, "scope").unwrap();
+        store
+            .save("invented-saved-id", "inbox", &bytes, None)
+            .unwrap()
+    };
+    let manifest_before = fs::read(fixture.manifest("scope")).unwrap();
+    let store = Store::open(&fixture.root, "scope").unwrap();
+    assert!(store.contains_saved("invented-saved-id").unwrap());
+    assert!(!store.contains_saved("invented-missing-id").unwrap());
+    assert!(store.contains_saved("invented-saved-id").unwrap());
+    assert!(store.contains_saved("").is_err());
+    assert!(store.contains_saved(&"x".repeat(4097)).is_err());
+    assert_eq!(
+        fs::read(fixture.manifest("scope")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(fs::read(saved.path).unwrap(), bytes);
+}
+
+#[test]
+fn downstream_inventory_and_reads_verify_saved_bytes_and_manifest() {
+    let fixture = Fixture::new();
+    let mut store = Store::open(&fixture.root, "synthetic-downstream").unwrap();
+    let saved = store.save("synthetic-id", "inbox", &pdf(), None).unwrap();
+    let inventory = store.saved_documents().unwrap();
+    assert_eq!(inventory.len(), 1);
+    assert_eq!(inventory[0].letter_id, "synthetic-id");
+    assert_eq!(inventory[0].sha256, saved.sha256);
+    assert_eq!(inventory[0].bytes, saved.bytes);
+    assert_eq!(inventory[0].media_kind, "pdf");
+    assert_eq!(store.read_saved("synthetic-id").unwrap(), pdf());
+    assert!(store.read_saved("unknown").is_err());
+    assert!(store.read_saved("").is_err());
+    fs::write(saved.path, b"changed synthetic file").unwrap();
+    assert!(store.read_saved("synthetic-id").is_err());
+    fs::write(fixture.manifest("synthetic-downstream"), b"{}").unwrap();
+    assert!(store.saved_documents().is_err());
+}
+
+#[test]
+fn private_state_accepts_only_fixed_names_and_detects_live_changes() {
+    let fixture = Fixture::new();
+    let mut store = Store::open(&fixture.root, "scope").unwrap();
+    for name in [
+        "../../outside",
+        "token.json",
+        "manifest.json",
+        "data",
+        "",
+        "paperless-target.json/extra",
+    ] {
+        assert!(store.read_private_state(name).is_err());
+        assert!(store.write_private_state(name, b"{}").is_err());
+    }
+    assert!(
+        store
+            .write_private_state("paperless-target.json", b"")
+            .is_err()
+    );
+    assert!(
+        store
+            .read_private_state("paperless-target.json")
+            .unwrap()
+            .is_none()
+    );
+    store
+        .write_private_state("paperless-target.json", b"{\"synthetic\":1}")
+        .unwrap();
+    assert_eq!(
+        store
+            .read_private_state("paperless-target.json")
+            .unwrap()
+            .unwrap(),
+        b"{\"synthetic\":1}"
+    );
+    store
+        .write_private_state("paperless-target.json", b"{\"synthetic\":2}")
+        .unwrap();
+    assert_eq!(
+        store
+            .read_private_state("paperless-target.json")
+            .unwrap()
+            .unwrap(),
+        b"{\"synthetic\":2}"
+    );
+    fs::write(
+        fixture.namespace("scope").join("paperless-target.json"),
+        b"{}",
+    )
+    .unwrap();
+    assert!(store.read_private_state("paperless-target.json").is_err());
+    assert!(
+        store
+            .write_private_state("paperless-target.json", b"{} ")
+            .is_err()
+    );
+}
+
+#[test]
+fn private_state_external_effect_obeys_atomic_commit_boundary() {
+    use epost_cli::error::Error;
+    use std::cell::Cell;
+    let fixture = Fixture::new();
+    let mut store = Store::open(&fixture.root, "scope").unwrap();
+    let effect = Cell::new(false);
+    let rollback = Cell::new(false);
+    let result = store.write_private_state_with_effect(
+        "paperless-target.json",
+        b"{}",
+        || {
+            effect.set(true);
+            Ok(())
+        },
+        |_| {
+            rollback.set(true);
+            Ok(())
+        },
+    );
+    assert!(result.is_ok());
+    assert!(effect.get());
+    assert!(!rollback.get());
+    effect.set(false);
+    assert!(
+        store
+            .write_private_state_with_effect(
+                "not-allowed.json",
+                b"{}",
+                || {
+                    effect.set(true);
+                    Ok(())
+                },
+                |_| Ok(())
+            )
+            .is_err()
+    );
+    assert!(!effect.get());
+    let before = store.read_private_state("paperless-target.json").unwrap();
+    assert!(
+        store
+            .write_private_state_with_effect(
+                "paperless-target.json",
+                b"{\"new\":1}",
+                || Err::<(), _>(Error::Config("synthetic effect failed")),
+                |_| Ok(())
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store.read_private_state("paperless-target.json").unwrap(),
+        before
+    );
+}
+
+#[test]
+fn private_state_failed_commit_rolls_back_effect() {
+    use std::cell::Cell;
+    let fixture = Fixture::new();
+    let mut store = Store::open(&fixture.root, "scope").unwrap();
+    let path = fixture.namespace("scope").join("paperless-target.json");
+    let rollback = Cell::new(false);
+    let result = store.write_private_state_with_effect(
+        "paperless-target.json",
+        b"{}",
+        || {
+            // A synthetic concurrent replacement after the preflight must be
+            // caught before commit, with the external fake effect undone.
+            fs::write(&path, b"conflicting synthetic bytes").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            Ok(23)
+        },
+        |undo| {
+            assert_eq!(undo, 23);
+            rollback.set(true);
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    assert!(rollback.get());
+    assert_eq!(fs::read(path).unwrap(), b"conflicting synthetic bytes");
+}
+
+#[cfg(unix)]
+#[test]
+fn private_state_symlinks_hardlinks_and_public_permissions_are_rejected() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for variant in 0..3 {
+        let fixture = Fixture::new();
+        let mut store = Store::open(&fixture.root, "scope").unwrap();
+        store
+            .write_private_state("paperless-target.json", b"{}")
+            .unwrap();
+        drop(store);
+        let state = fixture.namespace("scope").join("paperless-target.json");
+        match variant {
+            0 => {
+                fs::remove_file(&state).unwrap();
+                let external = fixture.base.join("synthetic-external");
+                fs::write(&external, b"{}").unwrap();
+                symlink(external, state).unwrap();
+            }
+            1 => fs::hard_link(&state, fixture.base.join("synthetic-hardlink")).unwrap(),
+            _ => fs::set_permissions(state, fs::Permissions::from_mode(0o644)).unwrap(),
+        }
+        assert!(Store::open(&fixture.root, "scope").is_err());
+    }
 }
 
 #[test]
@@ -187,8 +404,12 @@ fn detects_corrupt_and_missing_saved_files() {
         } else {
             let mut corrupt = fs::read(&saved.path).unwrap();
             corrupt[20] ^= 1;
+            assert_eq!(format_hint(&corrupt), Some("pdf"));
             fs::write(&saved.path, corrupt).unwrap();
         }
+        // Recorded membership remains a snapshot; content reuse still verifies
+        // the file and rejects modifications made after opening the store.
+        assert!(store.contains_saved("id").unwrap());
         assert!(store.verify_existing("id", "inbox").is_err());
         drop(store);
         assert!(Store::open(&fixture.root, "scope").is_err());
@@ -201,6 +422,7 @@ fn rejects_malformed_manifest_and_detects_changes_while_open() {
     let mut store = Store::open(&fixture.root, "scope").unwrap();
     store.save("id", "inbox", &pdf(), None).unwrap();
     fs::write(fixture.manifest("scope"), b"{broken synthetic JSON").unwrap();
+    assert!(store.contains_saved("id").is_err());
     assert!(store.verify_existing("id", "inbox").is_err());
     drop(store);
     assert!(Store::open(&fixture.root, "scope").is_err());
@@ -379,6 +601,9 @@ fn rejects_empty_truncated_pdf_and_explicitly_invalid_json() {
         (b"{\"unfinished\":".as_slice(), Some("application/json")),
         (b"[1,".as_slice(), Some("application/problem+json")),
     ] {
+        if bytes.starts_with(b"%PDF-") {
+            assert_eq!(format_hint(bytes), Some("pdf"));
+        }
         assert!(store.save("id", "inbox", bytes, content_type).is_err());
     }
     assert!(!fixture.manifest("scope").exists());
@@ -387,6 +612,122 @@ fn rejects_empty_truncated_pdf_and_explicitly_invalid_json() {
             .unwrap()
             .count(),
         0
+    );
+}
+
+#[test]
+fn format_hints_describe_signatures_without_proving_format_validity() {
+    for (bytes, expected) in [
+        (
+            b"%PDF-1.7\nsynthetic unfinished document".as_slice(),
+            Some("pdf"),
+        ),
+        (b"\x89PNG\r\n\x1a\n".as_slice(), Some("png")),
+        (b"\xff\xd8\xff".as_slice(), Some("jpeg")),
+        (b"II*\0".as_slice(), Some("tiff")),
+        (b"MM\0*".as_slice(), Some("tiff")),
+        (b"II+\0\x08\0\0\0".as_slice(), Some("tiff")),
+        (b"MM\0+\0\x08\0\0".as_slice(), Some("tiff")),
+        (b"GIF87a".as_slice(), Some("gif")),
+        (b"GIF89a".as_slice(), Some("gif")),
+        (b"PK\x03\x04".as_slice(), Some("zip")),
+        (b"PK\x05\x06".as_slice(), Some("zip")),
+        (b"PK\x07\x08".as_slice(), Some("zip")),
+        (
+            b"\xef\xbb\xbf \t<!DOCTYPE HTML>synthetic".as_slice(),
+            Some("html"),
+        ),
+        (
+            b"\n<HTML>synthetic incomplete markup".as_slice(),
+            Some("html"),
+        ),
+        (
+            "Synthetic UTF-8 text: snowman \u{2603}.\n".as_bytes(),
+            Some("text"),
+        ),
+        (b"<htmlish>synthetic".as_slice(), Some("text")),
+        (b"".as_slice(), None),
+        (b" \r\n\t".as_slice(), None),
+        (b"synthetic\0binary".as_slice(), None),
+        (b"\x01\x02\xff".as_slice(), None),
+        (b"synthetic\x1b[0m control".as_slice(), None),
+    ] {
+        assert_eq!(format_hint(bytes), expected);
+    }
+}
+
+#[test]
+fn binary_hints_are_derived_on_save_and_reuse_without_changing_records() {
+    let fixture = Fixture::new();
+    let mut store = Store::open(&fixture.root, "scope").unwrap();
+    let mut saved_documents = Vec::new();
+    for (index, (bytes, expected)) in [
+        (b"\x89PNG\r\n\x1a\n".as_slice(), Some("png")),
+        (b"\xff\xd8\xff".as_slice(), Some("jpeg")),
+        (b"II*\0".as_slice(), Some("tiff")),
+        (b"GIF89a".as_slice(), Some("gif")),
+        (b"PK\x03\x04".as_slice(), Some("zip")),
+        (
+            b"<!doctype html>synthetic incomplete markup".as_slice(),
+            Some("html"),
+        ),
+        (b"Synthetic UTF-8 document text.\n".as_slice(), Some("text")),
+        (b"\x01\x02\xff".as_slice(), None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("invented-format-{index}");
+        let saved = store
+            .save(&id, "inbox", bytes, Some("application/octet-stream"))
+            .unwrap();
+        assert_eq!(saved.format_hint.as_deref(), expected);
+        assert_eq!(saved.media_kind, "binary");
+        assert_eq!(saved.status, "saved_binary");
+        assert_eq!(saved.path.extension().unwrap(), "bin");
+        assert_eq!(fs::read(&saved.path).unwrap(), bytes);
+        let mut output = serde_json::to_value(&saved).unwrap();
+        if let Some(expected) = expected {
+            assert_eq!(output["format_hint"], expected);
+        } else {
+            assert!(output.get("format_hint").is_none());
+        }
+        // Older structured output still deserializes with an absent hint.
+        output.as_object_mut().unwrap().remove("format_hint");
+        assert_eq!(
+            serde_json::from_value::<SaveResult>(output)
+                .unwrap()
+                .format_hint,
+            None
+        );
+        saved_documents.push((id, bytes.to_vec(), saved));
+    }
+    let manifest_before = fs::read(fixture.manifest("scope")).unwrap();
+    for record in fixture.read_manifest("scope")["entries"]
+        .as_object()
+        .unwrap()
+        .values()
+    {
+        assert!(record.get("format_hint").is_none());
+        assert_eq!(record["kind"], "binary");
+    }
+    drop(store);
+    let mut store = Store::open(&fixture.root, "scope").unwrap();
+    for (id, bytes, saved) in saved_documents {
+        let verified = store.verify_existing(&id, "inbox").unwrap().unwrap();
+        let reused = store.save(&id, "inbox", &bytes, None).unwrap();
+        for result in [&verified, &reused] {
+            assert_eq!(result.format_hint, saved.format_hint);
+            assert_eq!(result.path, saved.path);
+            assert_eq!(result.sha256, saved.sha256);
+            assert_eq!(result.media_kind, "binary");
+            assert_eq!(result.status, "already_saved");
+        }
+        assert_eq!(fs::read(saved.path).unwrap(), bytes);
+    }
+    assert_eq!(
+        fs::read(fixture.manifest("scope")).unwrap(),
+        manifest_before
     );
 }
 
@@ -485,6 +826,7 @@ fn detects_directory_replacement_after_open() {
     let data = fixture.namespace("scope").join("data");
     fs::rename(&data, fixture.namespace("scope").join("old-data")).unwrap();
     fs::create_dir(&data).unwrap();
+    assert!(store.contains_saved("id").is_err());
     assert!(store.save("id", "inbox", &pdf(), None).is_err());
     assert_eq!(fs::read_dir(data).unwrap().count(), 0);
 }

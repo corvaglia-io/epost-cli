@@ -8,6 +8,21 @@ Implement a Rust CLI and reusable library for inbox and archive retrieval only. 
 
 Do not confuse archive retrieval with moving a letter into the archive.
 
+The maintainer also authorized an opt-in Paperless-ngx delivery destination.
+Uploading verified local PDFs and creating the explicitly configured delivery
+tags in Paperless are in scope. Keep ePost operations read-only. Paperless API
+tokens are supplied only at runtime or saved with explicit opt-in in the local
+macOS Keychain; never place them in config, reports, fixtures or CI. Develop and
+test this integration exclusively against synthetic localhost servers.
+
+The maintainer authorized the ergonomic `epost` command surface, Ratatui UI,
+read-only Doctor diagnostics, default profiles and multiple delivery destinations.
+All configured destinations participate by default; explicit destination names
+restrict one run. Folder copies and configurable Paperless tags, document-type
+mappings and selected provenance fields are in scope. Preserve existing
+credentials and delivery history during migration. These additions do not
+authorize ePost mailbox mutations or real credentials/documents in tests.
+
 ## Data and credentials
 
 - Use only public provider documentation and wholly synthetic test data.

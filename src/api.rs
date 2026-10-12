@@ -241,6 +241,17 @@ impl ApiClient {
         self.json(response).await
     }
 
+    /// Count unread inbox letters, without listing metadata or changing read state.
+    /// This is not an inventory total or a count of documents missing locally.
+    pub async fn inbox_unread_count(&mut self) -> Result<u32> {
+        let response = self
+            .get(self.endpoint("epost/v2/letters/inbox/count")?, &[])
+            .await?;
+        let count: i32 = self.json(response).await?;
+        u32::try_from(count)
+            .map_err(|_| Error::InvalidResponse("inbox unread count must be nonnegative"))
+    }
+
     pub async fn archive_page(
         &mut self,
         directory_id: Option<&str>,

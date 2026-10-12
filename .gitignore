@@ -11,4 +11,18 @@
 /runs/
 /epost.toml
 /epost.local.toml
+/config.json
+/config.local.json
+/.config.json.lock
+/.epost-cli/
+/epost-cli-data/
+paperless-target.json
+paperless-delivery.json
+.paperless-token
+paperless-token.txt
 .DS_Store
+
+# Private named destination settings and per-destination delivery histories.
+destinations.json
+source-metadata.json
+destination-*.json
