@@ -1,0 +1,82 @@
+Minimal ePost API contract
+
+Public sources:
+- OpenAPI: https://api.epost.ch/openapi?query=All
+- Swagger: https://api.epost.ch/docs
+- Private onboarding:
+  https://developer.epost.ch/docs/api-docs/v6nqmmjkxcery-how-to-access-the-letterbox-public-ap-is-with-a-private-tenant
+- Test onboarding:
+  https://developer.epost.ch/docs/api-docs/z6ydxfa37ns58-how-to-get-started-on-our-test-environment
+- Test Swagger: https://api-test.klara-epost.tech/docs
+
+This is a minimal implementation reference, not a copy of the full specification.
+Sandbox access/private parity is unconfirmed; do not substitute production in tests.
+
+Authentication
+- Private login uses the account email and separate ePost/KLARA password, not
+  the SwissID password. Onboarding/password changes are user-managed.
+- POST /core/latest/tenants: form username + password OR access_token.
+  Response: Tenant[] with tenant_id:string, company_id:int64, company_name:string.
+  No mailbox-kind discriminator: require explicit private/business and selection.
+- POST /core/latest/token: form grant_type=password, username, password,
+  tenant_id, company_id (decimal string).
+- Refresh: form grant_type=refresh_token, refresh_token. Response uses
+  refreshToken (camelCase), access_token, expires_in, refresh_expires_in,
+  token_type. Bind tokens to mailbox/origin and keep them only in memory.
+- Mail endpoints accept bearer OR X-API-KEY. Private API-key entitlement is not
+  established. Business API-key mode does not perform tenant discovery.
+
+Read-only mailbox endpoints
+- GET /epost/v2/letters: letter-folder=INBOX_FOLDER,
+  is-business-tenant=true|false, repeated letter-types query values for
+  CLASSIC_LETTER, SMART_LETTER, SMART_LETTER_ANSWER, SIMPLE_SHORT_MESSAGE,
+  INCAMAIL, SECURESEND. Response: Letter[]. limit=1..1000 (default 48),
+  offset>=0. read-status=READ|UNREAD|ALL. Date filters require paired
+  from-date/to-date in yyyy-MM-dd form.
+- GET /epost/v2/letters/inbox/count: unread count (JSON int32); optional
+  sender-participant-id. Reject negative/noninteger/out-of-range counts.
+  This is not a total-inventory count.
+- GET /epost/v2/letters/{letter-id}: one Letter.
+- GET /epost/v2/letters/{letter-id}/content: inbox or archived content bytes.
+  Media/schema declarations are ambiguous; do not assume PDF/base64. Build the
+  canonical URL with the ID encoded as one path segment. Never fetch arbitrary
+  letterContentReference URLs.
+- GET /epost/v2/archives/directories: flat Directory[] (not paginated).
+- GET /epost/v2/archives/letters: Letter[], limit/offset as above. Omit
+  directory-id for root; otherwise supply an explicit selectable directory ID.
+  There is no separate archive-content route.
+
+Relevant response fields
+- Letter: id, letterTitle, fileName, senderParticipantId, senderUserId,
+  senderCaseId, senderEndToEndId, documentTypes:string[], letterContentReference,
+  letterType, receivedDateTime, documentMessage, description, readStatus,
+  remainingDayToDelete:int64, registeredStatus, eLetterRegistered:bool.
+  Other listed scalar fields are strings. Preserve unknown enum values and
+  original timestamps; fail only when an action requires missing fields.
+- Directory: directoryId, directoryName, numberOfDocuments:int32,
+  parentDirectoryIds:string[], hasSubDirectories:bool. Branded IDs may be empty;
+  do not treat them as root or infer an undocumented selector. Multiple parents
+  are possible. Scan selectable folders even if their reported count is zero.
+- Required fields are not comprehensively specified. Use tolerant wire models.
+- ErrorMessage: uuid, createdTime, code, message, detail (strings); tenants may
+  return ErrorResponse {error,error_description}. Bodies are untrusted and may
+  be HTML/non-JSON. Show fixed redacted diagnostics, not raw response bodies.
+
+Coverage and failure rules
+- Offset lists have no snapshot/cursor/total. Bounded short-page termination is
+  not proof of complete coverage. Detect repeated/overlapping pages and missing
+  IDs; keep earlier observations when a later page fails.
+- An unselectable archive folder is only an empty observation when the provider
+  explicitly reports zero documents and no subfolders. Other cases are partial.
+- Successful content can be PDF, JSON or other bytes. Preserve unsupported bytes
+  with an explicit status. Do not substitute documentMessage for failed content.
+- Pending/unknown registered-letter status requires manual action or verification;
+  do not accept/reject or mark it read to make a download work.
+- Content 404 with accessible metadata means unavailable through this API route,
+  not proven deletion or a proven absence in the website/mobile app.
+- Stop after authentication loss. Bound GET retries and refresh/replay. Disable
+  uncontrolled redirects and environment proxy discovery; require HTTPS except
+  literal loopback synthetic transports. ePost origins are fixed by environment.
+
+Paperless is a separate destination; see docs/paperless.md. No ePost mutation
+endpoint is used by retrieval or delivery.

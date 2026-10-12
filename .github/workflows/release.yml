@@ -1,0 +1,159 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/workflows/ci.yml'
+      - 'scripts/release/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install declared Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Validate version and tag ancestry
+        id: version
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --locked --offline --no-deps --format-version 1 | jq -er \
+            '[.packages[] | select(.name == "epost-cli") | .version] | if length == 1 then .[0] else error("expected one CLI package") end')
+          bash scripts/release/validate-ref.sh "$version" "$REF_TYPE" "$REF_NAME" >> "$GITHUB_OUTPUT"
+      - name: Verify release tag guards with synthetic Git history
+        run: bash scripts/release/test-validate-ref.sh
+      - name: Verify packaging behavior with synthetic files
+        run: bash scripts/release/test-package.sh
+
+  quality:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  build:
+    needs: [validate, quality]
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install declared Rust toolchain and target
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: rustup toolchain install 1.98.0 --profile minimal --target "$RELEASE_TARGET"
+      - name: Build locked release binary
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$RELEASE_TARGET" --bin epost-cli
+      - name: Package and smoke-test the binary without credentials
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: bash scripts/release/package.sh "$RELEASE_VERSION" "$RELEASE_TARGET" "target/$RELEASE_TARGET/release/epost-cli" dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [validate, quality, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify all release assets and immutable tag
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG"
+          [[ "$(git rev-parse 'FETCH_HEAD^{commit}')" == "$RELEASE_COMMIT" ]] || { echo 'Remote tag moved after the build.' >&2; exit 1; }
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$RELEASE_COMMIT" FETCH_HEAD || { echo 'Release commit is no longer on main.' >&2; exit 1; }
+          cd dist
+          [[ "$(find . -maxdepth 1 -type f | wc -l)" -eq 8 ]] || { echo 'Expected exactly four archives and four checksum files.' >&2; exit 1; }
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            archive="epost-cli-$RELEASE_TAG-$target.tar.gz"
+            [[ -f "$archive" && -f "$archive.sha256" ]] || { echo 'Missing release asset.' >&2; exit 1; }
+            sha256sum --check "$archive.sha256"
+          done
+          cat ./*.tar.gz.sha256 | sort -k2 > SHA256SUMS
+      - name: Create complete draft release, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Existing releases fail; retries must not silently replace assets.
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo 'A release already exists for this tag; inspect it before retrying.' >&2
+            exit 1
+          fi
+          cp docs/release-notes.md "$RUNNER_TEMP/release-notes.md"
+          printf '\nCommit: %s\n' "$RELEASE_COMMIT" >> "$RUNNER_TEMP/release-notes.md"
+          args=(--draft --verify-tag --title "epost-cli $RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md")
+          version_without_build_metadata=${RELEASE_TAG%%+*}
+          if [[ "$version_without_build_metadata" == *-* ]]; then args+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" "${args[@]}" dist/*.tar.gz dist/SHA256SUMS
+          gh release edit "$RELEASE_TAG" --draft=false

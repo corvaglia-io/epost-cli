@@ -1,0 +1,2056 @@
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use epost_cli::{
+    api::{ApiClient, ClientOptions, Environment},
+    config::{self, Login, LoginMethod, Profile, SyncScope as Scope},
+    credentials,
+    error::{Error, Result},
+    keychain,
+    models::{Letter, Mailbox, MailboxKind},
+    pagination::{self, Inventory, Source},
+    progress::{Event, Reporter},
+    secret::Secret,
+    storage::{SaveResult, Store},
+    summary::{attention_lines, sync_summary},
+};
+
+mod destination_cli;
+mod doctor;
+mod interactive;
+#[cfg(test)]
+mod interactive_tests;
+mod modern;
+mod paperless_cli;
+mod presentation;
+mod tui;
+use serde::Serialize;
+use serde_json::{Value, json};
+use std::{
+    io::{self, IsTerminal, Read, Write},
+    path::{Path, PathBuf},
+};
+
+#[derive(Parser, Clone)]
+#[command(
+    version,
+    about = "Unofficial read-only ePost inbox and archive retrieval"
+)]
+struct Cli {
+    /// Never prompt for input or native credential approval.
+    #[arg(long, global = true)]
+    non_interactive: bool,
+    #[arg(skip)]
+    prepared_credentials: Option<(String, Secret)>,
+    #[arg(skip)]
+    prepared_paperless_token: Option<paperless_cli::PreparedToken>,
+    #[arg(skip)]
+    prepared_destination_tokens: std::collections::BTreeMap<String, paperless_cli::PreparedToken>,
+    #[arg(skip)]
+    destinations_prepared: bool,
+    #[arg(skip)]
+    prepared_destination_failures: std::collections::BTreeSet<String>,
+    /// Compact, structured JSON on stdout; diagnostics stay on stderr.
+    #[arg(long, global = true)]
+    json: bool,
+    /// Include technical explanations in the text summary.
+    #[arg(long, global = true)]
+    details: bool,
+    /// API environment (production unless a selected profile supplies it).
+    #[arg(long, global = true, value_enum)]
+    environment: Option<Environment>,
+    /// Use saved mailbox, output, scope and login preferences.
+    #[arg(long, global = true)]
+    profile: Option<String>,
+    /// Profile configuration file; otherwise use the platform configuration folder.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    #[arg(skip)]
+    selected_profile: Option<Profile>,
+    /// Show sync progress on stderr, including when stdout is JSON or redirected.
+    #[arg(long, global = true, conflicts_with = "no_progress")]
+    progress: bool,
+    /// Suppress automatic terminal progress.
+    #[arg(long, global = true, conflicts_with = "progress")]
+    no_progress: bool,
+    #[arg(long, global = true, value_enum)]
+    tenant_kind: Option<MailboxKind>,
+    #[arg(long, global = true)]
+    tenant_id: Option<String>,
+    #[arg(long, global = true, allow_hyphen_values = true)]
+    company_id: Option<i64>,
+    /// Read only the password from stdin instead of EPOST_PASSWORD or a prompt.
+    #[arg(long, global = true)]
+    password_stdin: bool,
+    /// Read the Paperless token from a private file; never pass tokens as arguments.
+    #[arg(long, global = true)]
+    paperless_token_file: Option<PathBuf>,
+    #[arg(long, global = true, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=120))]
+    timeout_seconds: u64,
+    #[arg(long, global = true, default_value_t = 2, value_parser = clap::value_parser!(u32).range(0..=5))]
+    retries: u32,
+    #[arg(long, global = true, default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=64))]
+    max_response_mib: u32,
+    /// Literal loopback origin used by the synthetic CLI integration tests.
+    #[arg(long, global = true, hide = true)]
+    mock_url: Option<String>,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Clone)]
+enum Command {
+    /// Open the interactive terminal application (also the default without a command).
+    Menu,
+    /// Fetch documents and deliver to all configured destinations.
+    Check(modern::ScopeArgs),
+    /// Inspect metadata and local delivery state without fetching documents.
+    Status(modern::StatusArgs),
+    /// Resume saved-document delivery to all configured destinations.
+    Deliver(modern::DeliveryArgs),
+    /// Audit local files and destination copies.
+    Verify(modern::DeliveryArgs),
+    /// Confirm an explicitly selected existing Paperless original without re-uploading.
+    Reconcile(modern::ReconcileArgs),
+    /// Diagnose credentials, local storage, DNS/TLS and destination access.
+    Doctor(doctor::DoctorArgs),
+    /// Configure named delivery destinations; all are used by default.
+    Destination {
+        #[command(subcommand)]
+        command: destination_cli::DestinationCommand,
+    },
+    /// List profiles or choose the default account.
+    Profile {
+        #[command(subcommand)]
+        command: modern::ProfileCommand,
+    },
+    /// Guided mailbox setup; remember the username and optionally use macOS Keychain.
+    Setup {
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, value_enum)]
+        scope: Option<Scope>,
+    },
+    /// Sign in once, browse readable inbox/archive pages, and download by number.
+    Browse {
+        #[arg(value_enum)]
+        location: Option<modern::Location>,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        page_size: u32,
+    },
+    /// Verify profile sign-in and remember its username; optionally save the password.
+    Login {
+        /// Explicitly save this profile's password in the local macOS Keychain.
+        #[arg(long)]
+        remember: bool,
+    },
+    /// Forget this profile's local Keychain password; retain its mailbox settings.
+    Logout,
+    /// Discover accessible tenants; never selects a mailbox automatically.
+    Tenants,
+    /// Retrieve inbox metadata.
+    Inbox {
+        #[command(subcommand)]
+        command: InboxCommand,
+    },
+    /// Retrieve archive folders and metadata.
+    Archive {
+        #[command(subcommand)]
+        command: ArchiveCommand,
+    },
+    /// Retrieve metadata for one letter ID in the selected mailbox.
+    Show { letter_id: String },
+    /// Download one inbox or archived letter by ID into the document store.
+    Download {
+        letter_id: String,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Retrieve documents across an explicitly selected inbox/archive scope.
+    Sync(SyncArgs),
+    /// Configure and deliver saved PDFs to Paperless-ngx; ePost stays read-only.
+    Paperless {
+        #[command(subcommand)]
+        command: paperless_cli::PaperlessCommand,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum InboxCommand {
+    List(ListArgs),
+    /// Check unread or unsaved inbox items without downloading content.
+    Check(CheckArgs),
+}
+
+#[derive(Args, Clone)]
+struct CheckArgs {
+    /// One unread-count request; does not check locally unsaved documents.
+    #[arg(long)]
+    unread_only: bool,
+    /// Local document store for comparing IDs (otherwise use the profile).
+    #[arg(long)]
+    output: Option<PathBuf>,
+    /// Sync the inbox if unread or locally unsaved items are observed.
+    #[arg(long)]
+    sync_if_needed: bool,
+    #[arg(long, default_value_t = 48, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    page_size: u32,
+    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=100000))]
+    max_pages: u32,
+}
+
+#[derive(Subcommand, Clone)]
+enum ArchiveCommand {
+    Folders,
+    List {
+        #[arg(long, conflicts_with = "directory_id")]
+        root: bool,
+        #[arg(long, required_unless_present = "root")]
+        directory_id: Option<String>,
+        #[command(flatten)]
+        paging: ListArgs,
+    },
+}
+
+#[derive(Args, Clone)]
+struct ListArgs {
+    #[arg(long, default_value_t = 48, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    page_size: u32,
+    #[arg(long, default_value_t = 0, conflicts_with = "all", value_parser = clap::value_parser!(u32).range(0..=2147483647))]
+    offset: u32,
+    /// Walk pages from offset zero; report overlaps and unfinished traversal.
+    #[arg(long)]
+    all: bool,
+    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=100000))]
+    max_pages: u32,
+}
+
+#[derive(Args, Clone)]
+struct SyncArgs {
+    /// Deliver saved PDFs to the explicitly configured Paperless destination after sync.
+    #[arg(long)]
+    paperless: bool,
+    #[arg(long, value_enum)]
+    scope: Option<Scope>,
+    #[arg(long)]
+    output: Option<PathBuf>,
+    #[arg(long, default_value_t = 48, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    page_size: u32,
+    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=100000))]
+    max_pages: u32,
+}
+
+struct ResolvedSyncArgs {
+    scope: Scope,
+    output: PathBuf,
+    page_size: u32,
+    max_pages: u32,
+    max_documents: usize,
+}
+
+fn environment(cli: &Cli) -> Environment {
+    cli.selected_profile
+        .as_ref()
+        .map(|profile| profile.environment)
+        .or(cli.environment)
+        .unwrap_or(Environment::Production)
+}
+
+fn output(cli: &Cli, explicit: Option<&Path>) -> Result<PathBuf> {
+    explicit
+        .map(Path::to_path_buf)
+        .or_else(|| cli.selected_profile.as_ref().map(|p| p.output.clone()))
+        .ok_or(Error::Config(
+            "supply --output or use a profile saved by setup",
+        ))
+}
+
+fn load_profile(cli: &mut Cli) -> Result<()> {
+    if matches!(cli.command, Command::Setup { .. }) {
+        return Ok(());
+    }
+    if cli.profile.is_none()
+        && !matches!(
+            cli.command,
+            Command::Tenants | Command::Profile { .. } | Command::Doctor(_)
+        )
+        && cli.tenant_kind.is_none()
+        && cli.tenant_id.is_none()
+        && cli.company_id.is_none()
+    {
+        cli.profile = config::default_profile(&config::path(cli.config.as_deref())?)?;
+    }
+    if let Some(name) = &cli.profile {
+        if cli.tenant_kind.is_some()
+            || cli.tenant_id.is_some()
+            || cli.company_id.is_some()
+            || cli.environment.is_some()
+        {
+            return Err(Error::Config(
+                "a profile supplies mailbox and environment; omit the explicit selection flags",
+            ));
+        }
+        cli.selected_profile = Some(config::load_profile(
+            &config::path(cli.config.as_deref())?,
+            name,
+        )?);
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct Retrieval {
+    letter_id: Option<String>,
+    source: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document: Option<SaveResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<ContentDiagnostic>,
+}
+
+/// Fixed codes and flags only: never response bodies, titles or reference URLs.
+#[derive(Serialize)]
+struct ContentDiagnostic {
+    reason_code: &'static str,
+    content_http_status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata_http_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    letter_type: Option<&'static str>,
+    has_message: bool,
+    has_file_name: bool,
+    has_content_reference: bool,
+    registered_pending: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_action: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct SyncReport {
+    scope: Scope,
+    /// Offset APIs provide no snapshot/total guarantee, even on a successful run.
+    mailbox_coverage_verified: bool,
+    pagination_complete: bool,
+    inventories: Vec<Value>,
+    archive_directories: Vec<Value>,
+    documents: Vec<Retrieval>,
+    issues: Vec<String>,
+}
+
+fn env_secret(name: &str) -> Result<Option<Secret>> {
+    match std::env::var(name) {
+        Ok(value) if value.is_empty() => {
+            Err(Error::Config("credential environment variable is empty"))
+        }
+        Ok(value) => Ok(Some(Secret::new(value))),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err(Error::Config(
+            "credential environment variable is not valid Unicode",
+        )),
+    }
+}
+
+fn password(cli: &Cli) -> Result<(String, Secret)> {
+    password_with_prompt(cli, |secret| {
+        if secret {
+            Ok(Some(rpassword::prompt_password(
+                "ePost/KLARA password (not SwissID): ",
+            )?))
+        } else {
+            eprint!("ePost account email: ");
+            io::stderr().flush()?;
+            let mut value = String::new();
+            io::stdin().read_line(&mut value)?;
+            Ok(Some(value.trim().to_owned()))
+        }
+    })
+}
+
+fn password_with_prompt(
+    cli: &Cli,
+    mut prompt: impl FnMut(bool) -> Result<Option<String>>,
+) -> Result<(String, Secret)> {
+    if let Some(credentials) = &cli.prepared_credentials {
+        return Ok(credentials.clone());
+    }
+    let username = match std::env::var("EPOST_USERNAME") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(Error::Config("account email is not valid Unicode"));
+        }
+        Err(_)
+            if cli
+                .selected_profile
+                .as_ref()
+                .and_then(|p| p.login.as_ref())
+                .is_some() =>
+        {
+            cli.selected_profile
+                .as_ref()
+                .unwrap()
+                .login
+                .as_ref()
+                .unwrap()
+                .username
+                .clone()
+        }
+        Err(_) if io::stdin().is_terminal() && !cli.non_interactive => {
+            prompt(false)?.ok_or(Error::Config("credential entry cancelled"))?
+        }
+        _ => {
+            return Err(Error::Config(
+                "set EPOST_USERNAME for password authentication",
+            ));
+        }
+    };
+    if username.trim().is_empty() || username.len() > 4096 || username.chars().any(char::is_control)
+    {
+        return Err(Error::Config(
+            "account email is empty, too long or contains control characters",
+        ));
+    }
+    let secret = if cli.password_stdin {
+        let mut input = zeroize::Zeroizing::new(String::new());
+        io::stdin().lock().take(8193).read_to_string(&mut input)?;
+        if input.len() > 8192 {
+            return Err(Error::Config("password input is too long"));
+        }
+        let input = input.trim_end_matches(['\r', '\n']);
+        if input.is_empty() || input.contains(['\r', '\n']) {
+            return Err(Error::Config(
+                "stdin must contain exactly one nonempty password line",
+            ));
+        }
+        Secret::new(input.to_owned())
+    } else if let Some(secret) = env_secret("EPOST_PASSWORD")? {
+        secret
+    } else if !matches!(cli.command, Command::Login { .. })
+        && cli
+            .selected_profile
+            .as_ref()
+            .and_then(|p| p.login.as_ref())
+            .is_some_and(|login| login.method == LoginMethod::MacosKeychain)
+    {
+        native_keychain_allowed(cli)?;
+        let profile = cli.selected_profile.as_ref().unwrap();
+        if profile.login.as_ref().unwrap().username != username {
+            return Err(Error::Config(
+                "runtime username differs from saved sign-in; supply a password or run profile login again",
+            ));
+        }
+        let retrieve = if cli.non_interactive {
+            credentials::get_noninteractive
+        } else {
+            credentials::get
+        };
+        retrieve(
+            &keychain::NativeStore,
+            &config::path(cli.config.as_deref())?,
+            cli.profile.as_deref().unwrap(),
+            environment(cli).base_url(),
+            profile,
+            &username,
+        )?
+    } else if io::stdin().is_terminal() && !cli.non_interactive {
+        loop {
+            let candidate =
+                Secret::new(prompt(true)?.ok_or(Error::Config("credential entry cancelled"))?);
+            if !candidate.expose().is_empty() && candidate.expose().len() <= 8192 {
+                break candidate;
+            }
+            eprintln!("Password is empty or too long. Please try again.");
+        }
+    } else {
+        return Err(Error::Config(
+            "set EPOST_PASSWORD or use --password-stdin for unattended password authentication",
+        ));
+    };
+    if secret.expose().is_empty() || secret.expose().len() > 8192 {
+        return Err(Error::Config("password is empty or too long"));
+    }
+    Ok((username, secret))
+}
+
+fn native_keychain_allowed(cli: &Cli) -> Result<()> {
+    if cli.mock_url.is_some() {
+        return Err(Error::Config(
+            "synthetic transports cannot access the native Keychain; supply synthetic runtime credentials",
+        ));
+    }
+    if !keychain::supported() {
+        return Err(Error::Config(
+            "saved Keychain sign-in requires macOS; supply runtime credentials or use profile login without --remember",
+        ));
+    }
+    Ok(())
+}
+
+fn native_keychain_mutation_allowed(cli: &Cli) -> Result<()> {
+    if cli.non_interactive {
+        return Err(Error::Config(
+            "changing saved Keychain credentials requires interactive mode; omit --non-interactive",
+        ));
+    }
+    native_keychain_allowed(cli)
+}
+
+fn uses_keychain(profile: &Profile) -> bool {
+    profile
+        .login
+        .as_ref()
+        .is_some_and(|login| login.method == LoginMethod::MacosKeychain)
+}
+
+fn persist_profile(
+    cli: &Cli,
+    name: &str,
+    profile: &Profile,
+    previous: Option<&Profile>,
+    secret: Option<&Secret>,
+) -> Result<()> {
+    let path = config::path(cli.config.as_deref())?;
+    // A copied macOS profile has no accessible local Keychain on another OS.
+    // Explicit username-only login can replace that reference without claiming
+    // that the password on the original Mac was removed.
+    if !keychain::supported()
+        && matches!(cli.command, Command::Login { remember: false })
+        && !uses_keychain(profile)
+    {
+        return config::save_profile_if_unchanged(&path, name, profile, previous);
+    }
+    if uses_keychain(profile) || previous.is_some_and(uses_keychain) {
+        native_keychain_mutation_allowed(cli)?;
+        credentials::save_profile_login(
+            &keychain::NativeStore,
+            &path,
+            name,
+            profile,
+            previous,
+            secret,
+        )
+    } else {
+        config::save_profile_if_unchanged(&path, name, profile, previous)
+    }
+}
+
+fn progress_enabled(cli: &Cli) -> bool {
+    !cli.no_progress && (cli.progress || !cli.json)
+}
+
+fn mailbox(cli: &Cli) -> Result<Mailbox> {
+    if let Some(profile) = &cli.selected_profile {
+        return Ok(profile.mailbox.clone());
+    }
+    let tenant_id = cli
+        .tenant_id
+        .clone()
+        .filter(|id| !id.is_empty() && id.len() <= 4096)
+        .ok_or(Error::Config("--tenant-id is required"))?;
+    let company_id = cli.company_id.filter(|id| *id >= 0).ok_or(Error::Config(
+        "--company-id must be explicitly supplied and nonnegative",
+    ))?;
+    let kind = cli
+        .tenant_kind
+        .ok_or(Error::Config("--tenant-kind private|business is required"))?;
+    Ok(Mailbox {
+        tenant_id,
+        company_id,
+        kind,
+    })
+}
+
+fn client(cli: &Cli, mailbox: Option<Mailbox>) -> Result<ApiClient> {
+    let options = ClientOptions {
+        timeout_secs: cli.timeout_seconds,
+        max_retries: cli.retries,
+        max_response_bytes: cli.max_response_mib as usize * 1024 * 1024,
+    };
+    match cli.mock_url.as_deref() {
+        Some(url) => ApiClient::for_test(url, mailbox, options),
+        None => ApiClient::new(environment(cli), mailbox, options),
+    }
+}
+
+async fn authenticate(cli: &Cli, client: &mut ApiClient, mailbox: &Mailbox) -> Result<()> {
+    let token = env_secret("EPOST_BEARER_TOKEN")?;
+    let key = env_secret("EPOST_API_KEY")?;
+    if (token.is_some() && key.is_some())
+        || ((token.is_some() || key.is_some()) && cli.password_stdin)
+    {
+        return Err(Error::Config("choose one authentication method"));
+    }
+    if let Some(token) = token {
+        return client.set_bearer(token);
+    }
+    if let Some(key) = key {
+        return client.set_api_key(key);
+    }
+    let (username, secret) = password(cli)?;
+    let tenants = client.tenants_password(&username, &secret).await?;
+    if !tenants
+        .iter()
+        .any(|t| t.tenant_id == mailbox.tenant_id && t.company_id == mailbox.company_id)
+    {
+        return Err(Error::Config(
+            "selected tenant/company is not present in account tenant discovery",
+        ));
+    }
+    client.login(&username, &secret).await
+}
+
+fn namespace(cli: &Cli, mailbox: &Mailbox) -> Result<String> {
+    let origin = cli
+        .mock_url
+        .as_deref()
+        .unwrap_or(environment(cli).base_url());
+    serde_json::to_string(&(origin, &mailbox.tenant_id, mailbox.company_id, mailbox.kind))
+        .map_err(|_| Error::Config("cannot construct mailbox namespace"))
+}
+
+fn value<T: Serialize>(data: T) -> Result<Value> {
+    serde_json::to_value(data).map_err(|_| Error::InvalidResponse("output serialization failed"))
+}
+
+async fn list(client: &mut ApiClient, source: Source, args: &ListArgs) -> Result<(Value, u8)> {
+    if args.all {
+        let result = pagination::collect(client, source, args.page_size, args.max_pages).await?;
+        let exit = if result.failure_exit_code == Some(3) {
+            3
+        } else if result.pagination_complete {
+            0
+        } else {
+            2
+        };
+        return Ok((value(result)?, exit));
+    }
+    let letters = pagination::page(client, &source, args.page_size, args.offset).await?;
+    Ok((
+        json!({"source": source, "letters": letters, "offset": args.offset,
+        "pagination_complete": false, "single_page": true}),
+        0,
+    ))
+}
+
+fn registered_pending(letter: &Letter) -> bool {
+    if letter.registered_status.as_deref() == Some("PENDING") {
+        return true;
+    }
+    letter.e_letter_registered == Some(true)
+        && !matches!(
+            letter.registered_status.as_deref(),
+            Some("ACCEPTED" | "LEGALLY_ACCEPTED")
+        )
+}
+
+fn content_diagnostic(letter: &Letter) -> ContentDiagnostic {
+    let present = |field: &str| {
+        letter
+            .extra
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    let letter_type = match letter.letter_type.as_deref() {
+        Some("SIMPLE_SHORT_MESSAGE") => Some("SIMPLE_SHORT_MESSAGE"),
+        Some("CLASSIC_LETTER") => Some("CLASSIC_LETTER"),
+        Some("SMART_LETTER") => Some("SMART_LETTER"),
+        Some("SMART_LETTER_ANSWER") => Some("SMART_LETTER_ANSWER"),
+        Some("INCAMAIL") => Some("INCAMAIL"),
+        Some("SECURESEND") => Some("SECURESEND"),
+        _ => None,
+    };
+    ContentDiagnostic {
+        reason_code: "content_unavailable_metadata_available",
+        content_http_status: 404,
+        metadata_http_status: None,
+        metadata_error: None,
+        letter_type,
+        has_message: present("documentMessage"),
+        has_file_name: letter
+            .file_name
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty()),
+        has_content_reference: present("letterContentReference"),
+        registered_pending: registered_pending(letter),
+        recovery_action: None,
+    }
+}
+
+async fn retrieve(
+    client: &mut ApiClient,
+    store: &mut Store,
+    letter: &Letter,
+    source: &str,
+) -> Result<Retrieval> {
+    let id = letter
+        .id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .ok_or(Error::InvalidResponse("letter has no usable ID"))?;
+    let existing = store.verify_existing(id, source)?;
+    store.record_metadata(letter)?;
+    if registered_pending(letter) {
+        return Ok(Retrieval {
+            letter_id: Some(id.into()),
+            source: source.into(),
+            status: "awaiting_manual_acceptance_or_status_verification".into(),
+            document: existing,
+            error: None,
+            diagnostic: None,
+        });
+    }
+    if let Some(document) = existing {
+        return Ok(Retrieval {
+            letter_id: Some(id.into()),
+            source: source.into(),
+            status: document.status.clone(),
+            document: Some(document),
+            error: None,
+            diagnostic: None,
+        });
+    }
+    let content = match client.content(id).await {
+        Ok(content) => content,
+        Err(Error::Http(404)) => {
+            // One canonical, bounded metadata check. Never follow a provider's
+            // content reference or substitute metadata for a downloaded file.
+            let mut diagnostic = content_diagnostic(letter);
+            let mut status = "failed";
+            match client.letter(id).await {
+                Ok(current) if current.id.as_deref() == Some(id) => {
+                    store.record_metadata(&current)?;
+                    diagnostic = content_diagnostic(&current);
+                    diagnostic.metadata_http_status = Some(200);
+                    if registered_pending(&current) {
+                        status = "awaiting_manual_acceptance_or_status_verification";
+                    } else {
+                        diagnostic.recovery_action = Some("check_or_download_in_epost");
+                    }
+                }
+                Ok(_) => {
+                    diagnostic.reason_code = "metadata_id_mismatch";
+                    diagnostic.metadata_http_status = Some(200);
+                }
+                Err(error) if error.exit_code() == 3 => return Err(error),
+                Err(Error::Http(404)) => {
+                    diagnostic.reason_code = "letter_unavailable";
+                    diagnostic.metadata_http_status = Some(404);
+                }
+                Err(error) => {
+                    diagnostic.reason_code = "metadata_check_failed";
+                    if let Error::Http(code) = &error {
+                        diagnostic.metadata_http_status = Some(*code);
+                    }
+                    diagnostic.metadata_error = Some(error.to_string());
+                }
+            }
+            let error = if diagnostic.recovery_action.is_some() {
+                epost_cli::summary::PUBLIC_API_CONTENT_UNAVAILABLE_MESSAGE.to_owned()
+            } else {
+                Error::Http(404).to_string()
+            };
+            return Ok(Retrieval {
+                letter_id: Some(id.into()),
+                source: source.into(),
+                status: status.into(),
+                document: None,
+                error: Some(error),
+                diagnostic: Some(diagnostic),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let document = store.save(id, source, &content.bytes, content.content_type.as_deref())?;
+    Ok(Retrieval {
+        letter_id: Some(id.into()),
+        source: source.into(),
+        status: document.status.clone(),
+        document: Some(document),
+        error: None,
+        diagnostic: None,
+    })
+}
+
+fn supported(record: &Retrieval) -> bool {
+    matches!(record.status.as_str(), "saved_pdf" | "already_saved")
+        && record
+            .document
+            .as_ref()
+            .is_some_and(|d| d.media_kind == "pdf")
+}
+
+async fn sync(
+    cli: &Cli,
+    client: &mut ApiClient,
+    mailbox: &Mailbox,
+    args: &ResolvedSyncArgs,
+) -> Result<(Value, u8)> {
+    let mut reporter = Reporter::new(progress_enabled(cli));
+    let result = sync_with_progress(cli, client, mailbox, args, &mut reporter).await;
+    // TTY and guided views own the final human summary. JSON/pipe users can
+    // opt into a single progress summary on stderr while stdout stays machine-readable.
+    let source_code = match &result {
+        Ok((_, code)) => *code,
+        Err(error) => error.exit_code(),
+    };
+    if !reporter.finish_in_frontend(source_code)
+        && matches!(cli.command, Command::Sync(_))
+        && (cli.json || !io::stdout().is_terminal())
+    {
+        reporter.event(Event::Finished {
+            exit_code: match &result {
+                Ok((_, code)) => *code,
+                Err(error) => error.exit_code(),
+            },
+        });
+        if progress_enabled(cli)
+            && let Ok((report, _)) = &result
+        {
+            for line in attention_lines(report) {
+                let _ = writeln!(io::stderr().lock(), "{line}");
+            }
+        }
+    }
+
+    result
+}
+
+async fn sync_with_progress(
+    cli: &Cli,
+    client: &mut ApiClient,
+    mailbox: &Mailbox,
+    args: &ResolvedSyncArgs,
+    reporter: &mut Reporter,
+) -> Result<(Value, u8)> {
+    let mut store = Store::open(&args.output, &namespace(cli, mailbox)?)?;
+    let mut report = SyncReport {
+        scope: args.scope,
+        mailbox_coverage_verified: false,
+        pagination_complete: true,
+        inventories: Vec::new(),
+        archive_directories: Vec::new(),
+        documents: Vec::new(),
+        issues: Vec::new(),
+    };
+    let mut sources = Vec::new();
+    if matches!(args.scope, Scope::Inbox | Scope::Both) {
+        sources.push(Source::Inbox);
+    }
+    if matches!(args.scope, Scope::Archive | Scope::Both) {
+        sources.push(Source::ArchiveRoot);
+        reporter.event(Event::ArchiveFolders);
+        match client.directories().await {
+            Ok(directories) => {
+                let mut seen = std::collections::HashSet::new();
+                for (index, directory) in directories.into_iter().enumerate() {
+                    if index >= 10_000 {
+                        report.pagination_complete = false;
+                        report
+                            .issues
+                            .push("archive directory safety limit reached".into());
+                        break;
+                    }
+                    let observation = json!({
+                        "directory_id": directory.directory_id,
+                        "name": directory.directory_name,
+                        "number_of_documents": directory.number_of_documents,
+                        "has_sub_directories": directory.has_sub_directories,
+                        "parent_directory_ids": directory.parent_directory_ids,
+                    });
+                    let selection = match directory.directory_id.filter(|id| !id.is_empty()) {
+                        Some(id) if seen.insert(id.clone()) => {
+                            sources.push(Source::ArchiveDirectory(id));
+                            "selected"
+                        }
+                        Some(_) => {
+                            report.pagination_complete = false;
+                            report.issues.push("duplicate archive directory ID".into());
+                            "duplicate"
+                        }
+                        None if directory.number_of_documents == Some(0)
+                            && directory.has_sub_directories == Some(false) =>
+                        {
+                            // An observation, not proof of complete mailbox coverage.
+                            "unselectable_empty"
+                        }
+                        None => {
+                            report.pagination_complete = false;
+                            report
+                                .issues
+                                .push("archive directory has no documented usable selector".into());
+                            "unselectable"
+                        }
+                    };
+                    report.archive_directories.push(json!({
+                        "directory": observation, "selection": selection,
+                    }));
+                }
+            }
+            Err(error) => {
+                report.pagination_complete = false;
+                report
+                    .issues
+                    .push(format!("archive folder enumeration: {error}"));
+                if error.exit_code() == 3 {
+                    return Ok((value(report)?, 3));
+                }
+            }
+        }
+    }
+    let mut exit = 0;
+    let mut attempts = 0;
+    for source in sources {
+        if epost_cli::progress::stop_requested() {
+            report
+                .issues
+                .push("stopped before remaining sources".into());
+            return Ok((value(report)?, exit.max(2)));
+        }
+        reporter.event(Event::InventoryStarted {
+            label: match source {
+                Source::Inbox => "inbox",
+                Source::ArchiveRoot => "archive root",
+                Source::ArchiveDirectory(_) => "archive folder",
+            }
+            .into(),
+        });
+        if report.documents.len() >= 100_000 {
+            report.pagination_complete = false;
+            report
+                .issues
+                .push("sync document safety limit reached; remaining sources deferred".into());
+            return Ok((value(report)?, exit.max(2)));
+        }
+        let inventory: Inventory = match pagination::collect_with_progress(
+            client,
+            source.clone(),
+            args.page_size,
+            args.max_pages,
+            |event| {
+                if let pagination::PageProgress::Started { page, documents } = event {
+                    reporter.event(Event::Page { page, documents });
+                }
+            },
+        )
+        .await
+        {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                report.pagination_complete = false;
+                report.issues.push(format!("{}: {error}", source.label()));
+                exit = exit.max(if error.exit_code() == 3 { 3 } else { 2 });
+                if error.exit_code() == 3 {
+                    break;
+                }
+                continue;
+            }
+        };
+        report.pagination_complete &= inventory.pagination_complete;
+        reporter.event(Event::InventoryComplete {
+            documents: inventory.letters.len(),
+            complete: inventory.pagination_complete,
+        });
+        report.inventories.push(json!({"source": inventory.source, "letters": inventory.letters.len(),
+            "pages": inventory.pages, "pagination_complete": inventory.pagination_complete, "issues": inventory.issues,
+            "failure_exit_code": inventory.failure_exit_code}));
+        if inventory.failure_exit_code == Some(3) {
+            for letter in inventory
+                .letters
+                .into_iter()
+                .take(100_000 - report.documents.len())
+            {
+                reporter.event(Event::DocumentComplete {
+                    status: "deferred_due_to_authentication_failure".into(),
+                    media_kind: None,
+                });
+                report.documents.push(Retrieval {
+                    letter_id: letter.id,
+                    source: source.label(),
+                    status: "deferred_due_to_authentication_failure".into(),
+                    document: None,
+                    error: None,
+                    diagnostic: None,
+                });
+            }
+            report.issues.push(
+                "authentication failed during pagination; remaining retrieval deferred".into(),
+            );
+            return Ok((value(report)?, exit.max(3)));
+        }
+        for (index, letter) in inventory.letters.iter().enumerate() {
+            if epost_cli::progress::stop_requested() {
+                report
+                    .issues
+                    .push("stopped before remaining documents".into());
+                return Ok((value(report)?, exit.max(2)));
+            }
+            if report.documents.len() >= 100_000 {
+                report.pagination_complete = false;
+                report
+                    .issues
+                    .push("sync document safety limit reached; remaining letters deferred".into());
+                return Ok((value(report)?, exit.max(2)));
+            }
+            let already = match letter.id.as_deref() {
+                Some(id) => store.contains_saved(id)?,
+                None => false,
+            };
+            if !already && !registered_pending(letter) && attempts >= args.max_documents {
+                reporter.event(Event::DocumentStarted {
+                    index: index + 1,
+                    total: inventory.letters.len(),
+                });
+                reporter.event(Event::DocumentComplete {
+                    status: "deferred_limit".into(),
+                    media_kind: None,
+                });
+                report.documents.push(Retrieval {
+                    letter_id: letter.id.clone(),
+                    source: source.label(),
+                    status: "deferred_limit".into(),
+                    document: None,
+                    error: None,
+                    diagnostic: None,
+                });
+                exit = exit.max(2);
+                continue;
+            }
+            if !already && !registered_pending(letter) {
+                attempts += 1;
+            }
+
+            reporter.event(Event::DocumentStarted {
+                index: index + 1,
+                total: inventory.letters.len(),
+            });
+            match retrieve(client, &mut store, letter, &source.label()).await {
+                Ok(record) => {
+                    reporter.event(Event::DocumentComplete {
+                        status: record.status.clone(),
+                        media_kind: record.document.as_ref().map(|d| d.media_kind.clone()),
+                    });
+                    if !supported(&record) {
+                        exit = exit.max(2);
+                    }
+                    report.documents.push(record);
+                }
+                Err(error) => {
+                    reporter.event(Event::DocumentComplete {
+                        status: "failed".into(),
+                        media_kind: None,
+                    });
+                    let code = error.exit_code();
+                    exit = exit.max(if code == 3 || code == 4 { code } else { 2 });
+                    report.documents.push(Retrieval {
+                        letter_id: letter.id.clone(),
+                        source: source.label(),
+                        status: "failed".into(),
+                        document: None,
+                        error: Some(error.to_string()),
+                        diagnostic: None,
+                    });
+                    if code == 3 {
+                        report.issues.push(
+                            "authentication failed during retrieval; remaining letters deferred"
+                                .into(),
+                        );
+                        return Ok((value(report)?, exit));
+                    }
+                }
+            }
+        }
+    }
+    if !report.pagination_complete || !report.issues.is_empty() {
+        exit = exit.max(2);
+    }
+    Ok((value(report)?, exit))
+}
+
+async fn check_inbox(
+    cli: &Cli,
+    client: &mut ApiClient,
+    mailbox: &Mailbox,
+    args: &CheckArgs,
+) -> Result<(Value, u8)> {
+    let (mut report, mut code) = if args.unread_only {
+        let count = client.inbox_unread_count().await?;
+        (
+            json!({
+                "mode": "unread_count", "unread_count": count,
+                "has_unread": count > 0, "has_new": null,
+                "sync_needed": count > 0, "pagination_complete": null,
+                "mailbox_coverage_verified": false, "issues": [],
+            }),
+            0,
+        )
+    } else {
+        let destination = output(cli, args.output.as_deref())?;
+        let store = Store::open(&destination, &namespace(cli, mailbox)?)?;
+        let mut reporter = Reporter::new(progress_enabled(cli));
+        reporter.event(Event::InventoryStarted {
+            label: "inbox".into(),
+        });
+        let inventory = pagination::collect_with_progress(
+            client,
+            Source::Inbox,
+            args.page_size,
+            args.max_pages,
+            |event| {
+                if let pagination::PageProgress::Started { page, documents } = event {
+                    reporter.event(Event::Page { page, documents });
+                }
+            },
+        )
+        .await?;
+        reporter.event(Event::InventoryComplete {
+            documents: inventory.letters.len(),
+            complete: inventory.pagination_complete,
+        });
+        let mut unread = 0;
+        let mut unknown_read = 0;
+        let mut unsaved = 0;
+        let mut saved = 0;
+        for letter in &inventory.letters {
+            match letter.extra.get("readStatus").and_then(Value::as_str) {
+                Some("UNREAD") => unread += 1,
+                Some("READ") => {}
+                _ => unknown_read += 1,
+            }
+            if let Some(id) = letter.id.as_deref().filter(|id| !id.is_empty()) {
+                if store.contains_saved(id)? {
+                    saved += 1;
+                } else {
+                    unsaved += 1;
+                }
+            }
+        }
+        let complete = inventory.pagination_complete;
+        let has_new = if unsaved > 0 {
+            Some(true)
+        } else if complete {
+            Some(false)
+        } else {
+            None
+        };
+        let has_unread = if unread > 0 {
+            Some(true)
+        } else if complete && unknown_read == 0 {
+            Some(false)
+        } else {
+            None
+        };
+        let needed = if has_new == Some(true) || has_unread == Some(true) {
+            Some(true)
+        } else if has_new == Some(false) && has_unread == Some(false) {
+            Some(false)
+        } else {
+            None
+        };
+        let code = if inventory.failure_exit_code == Some(3) {
+            3
+        } else if !complete || unknown_read > 0 {
+            2
+        } else {
+            0
+        };
+        let mut issues = inventory.issues;
+        if unknown_read > 0 {
+            issues.push("some inbox items have missing or unknown read status".into());
+        }
+        (
+            json!({
+                "mode": "metadata_and_local_store", "inbox_documents": inventory.letters.len(),
+                "unread_count": unread, "unknown_read_status_count": unknown_read,
+                "new_documents_count": unsaved, "already_saved_count": saved,
+                "has_unread": has_unread, "has_new": has_new, "sync_needed": needed,
+                "pages": inventory.pages, "pagination_complete": complete,
+                "mailbox_coverage_verified": false, "issues": issues,
+            }),
+            code,
+        )
+    };
+    report["check_exit_code"] = json!(code);
+    report["sync_requested"] = json!(args.sync_if_needed);
+    report["sync_performed"] = json!(false);
+    if args.sync_if_needed && report["sync_needed"] == true && code != 3 {
+        // Store comparison guard is dropped before opening the sync store.
+        let destination = output(cli, args.output.as_deref())?;
+        let mut reporter = Reporter::new(progress_enabled(cli));
+        let result = sync_with_progress(
+            cli,
+            client,
+            mailbox,
+            &ResolvedSyncArgs {
+                scope: Scope::Inbox,
+                output: destination,
+                page_size: args.page_size,
+                max_pages: args.max_pages,
+                max_documents: 100_000,
+            },
+            &mut reporter,
+        )
+        .await;
+        let source_code = match &result {
+            Ok((_, code)) => *code,
+            Err(error) => error.exit_code(),
+        };
+        if !reporter.finish_in_frontend(source_code) && (cli.json || !io::stdout().is_terminal()) {
+            reporter.event(Event::Finished {
+                exit_code: match &result {
+                    Ok((_, code)) => *code,
+                    Err(error) => error.exit_code(),
+                },
+            });
+            if progress_enabled(cli)
+                && let Ok((retrieval, _)) = &result
+            {
+                for line in attention_lines(retrieval) {
+                    let _ = writeln!(io::stderr().lock(), "{line}");
+                }
+            }
+        }
+        code = attach_check_sync(&mut report, code, result);
+    }
+    Ok((report, code))
+}
+
+/// Preserve a completed check, including uncertainty, even if its requested
+/// sync fails before producing a retrieval report.
+fn attach_check_sync(report: &mut Value, check_code: u8, result: Result<(Value, u8)>) -> u8 {
+    report["sync_performed"] = json!(true);
+    let sync_code = match result {
+        Ok((retrieval, code)) => {
+            report["sync"] = retrieval;
+            code
+        }
+        Err(error) => {
+            report["sync_error"] = json!(error.to_string());
+            error.exit_code()
+        }
+    };
+    report["sync_exit_code"] = json!(sync_code);
+    check_code.max(sync_code)
+}
+
+fn check_summary(report: &Value, code: u8) -> Vec<String> {
+    let mut lines = if report["mode"] == "unread_count" {
+        vec![format!(
+            "Inbox: {} unread. Unsaved documents were not checked.",
+            report["unread_count"]
+        )]
+    } else {
+        vec![format!(
+            "Inbox: {} unread, {} locally unsaved, {} already saved, {} with unknown read status.",
+            report["unread_count"],
+            report["new_documents_count"],
+            report["already_saved_count"],
+            report["unknown_read_status_count"]
+        )]
+    };
+    if report["sync"].is_object() {
+        lines.extend(sync_summary(
+            &report["sync"],
+            report["sync_exit_code"].as_u64().unwrap_or(2) as u8,
+        ));
+    } else {
+        lines.push(
+            match report["sync_needed"].as_bool() {
+                Some(true) => "Inbox items need attention. Run sync to retrieve unsaved documents.",
+                Some(false) if report["mode"] == "unread_count" => {
+                    "No unread inbox items were observed. Unsaved documents were not checked."
+                }
+                Some(false) => "No unread or unsaved inbox items were observed.",
+                None => "Inbox check is inconclusive; retry or inspect ePost.",
+            }
+            .into(),
+        );
+        lines.push(
+            "Read status is not changed. Counts are observations; mailbox coverage is unverified."
+                .into(),
+        );
+    }
+    if code != 0
+        && (report["sync"].is_null() || report["check_exit_code"].as_u64().unwrap_or(0) > 0)
+    {
+        lines.push(format!(
+            "Check/sync needs attention (exit {code}); inspect the detailed report."
+        ));
+    }
+    lines
+}
+
+async fn run(cli: &Cli) -> Result<(Value, u8)> {
+    match &cli.command {
+        Command::Check(_)
+        | Command::Status(_)
+        | Command::Deliver(_)
+        | Command::Verify(_)
+        | Command::Reconcile(_)
+        | Command::Profile { .. } => return modern::run(cli).await,
+        Command::Destination { command } => return destination_cli::run(cli, command).await,
+        Command::Doctor(args) => return doctor::run(cli, args).await,
+        Command::Menu => return Err(Error::Config("menu requires an interactive terminal")),
+        _ => {}
+    }
+    if let Command::Paperless { command } = &cli.command {
+        return paperless_cli::run(cli, command).await;
+    }
+    if matches!(cli.command, Command::Logout) {
+        let name = cli
+            .profile
+            .as_deref()
+            .ok_or(Error::Config("logout requires --profile"))?;
+        let previous = cli
+            .selected_profile
+            .as_ref()
+            .ok_or(Error::Config("logout requires a saved profile"))?;
+        let mut profile = previous.clone();
+        if let Some(login) = profile.login.as_mut() {
+            login.method = LoginMethod::Prompt;
+        }
+        persist_profile(cli, name, &profile, Some(previous), None)?;
+        return Ok((
+            json!({"login_method": "prompt", "password_forgotten": true}),
+            0,
+        ));
+    }
+    if matches!(cli.command, Command::Tenants) {
+        let mut client = client(cli, None)?;
+        let token = env_secret("EPOST_BEARER_TOKEN")?;
+        if env_secret("EPOST_API_KEY")?.is_some() {
+            return Err(Error::Config(
+                "tenant discovery requires password or bearer authentication",
+            ));
+        }
+        let tenants = if let Some(token) = token {
+            if cli.password_stdin {
+                return Err(Error::Config("choose one authentication method"));
+            }
+            client.tenants_bearer(&token).await?
+        } else {
+            let (username, secret) = password(cli)?;
+            client.tenants_password(&username, &secret).await?
+        };
+        return Ok((value(tenants)?, 0));
+    }
+    let mailbox = mailbox(cli)?;
+    let mut client = client(cli, Some(mailbox.clone()))?;
+    let mut authentication_progress = Reporter::new(progress_enabled(cli));
+    authentication_progress.event(Event::Authenticating);
+    if let Err(error) = authenticate(cli, &mut client, &mailbox).await {
+        authentication_progress.event(Event::Finished {
+            exit_code: error.exit_code(),
+        });
+        return Err(error);
+    }
+    if matches!(operation_kind(cli), tui::OperationKind::Inspect) {
+        authentication_progress.event(Event::InventoryStarted {
+            label: "mailbox metadata".into(),
+        });
+    }
+    match &cli.command {
+        Command::Setup { .. }
+        | Command::Browse { .. }
+        | Command::Login { .. }
+        | Command::Logout => unreachable!(),
+        Command::Tenants => unreachable!(),
+        Command::Paperless { .. }
+        | Command::Check(_)
+        | Command::Status(_)
+        | Command::Deliver(_)
+        | Command::Verify(_)
+        | Command::Reconcile(_)
+        | Command::Profile { .. }
+        | Command::Destination { .. }
+        | Command::Doctor(_)
+        | Command::Menu => unreachable!(),
+        Command::Inbox {
+            command: InboxCommand::List(args),
+        } => list(&mut client, Source::Inbox, args).await,
+        Command::Inbox {
+            command: InboxCommand::Check(args),
+        } => check_inbox(cli, &mut client, &mailbox, args).await,
+        Command::Archive {
+            command: ArchiveCommand::Folders,
+        } => Ok((value(client.directories().await?)?, 0)),
+        Command::Archive {
+            command:
+                ArchiveCommand::List {
+                    root,
+                    directory_id,
+                    paging,
+                },
+        } => {
+            let source = if *root {
+                Source::ArchiveRoot
+            } else {
+                Source::ArchiveDirectory(
+                    directory_id
+                        .clone()
+                        .ok_or(Error::Config("archive selector required"))?,
+                )
+            };
+            list(&mut client, source, paging).await
+        }
+        Command::Show { letter_id } => Ok((value(client.letter(letter_id).await?)?, 0)),
+        Command::Download { letter_id, output } => {
+            let output = self::output(cli, output.as_deref())?;
+            let mut store = Store::open(&output, &namespace(cli, &mailbox)?)?;
+            let letter = client.letter(letter_id).await?;
+            if letter.id.as_deref() != Some(letter_id) {
+                return Err(Error::InvalidResponse(
+                    "letter ID does not match requested ID",
+                ));
+            }
+            authentication_progress.event(Event::InventoryStarted {
+                label: "selected document".into(),
+            });
+            authentication_progress.event(Event::InventoryComplete {
+                documents: 1,
+                complete: true,
+            });
+            authentication_progress.event(Event::DocumentStarted { index: 1, total: 1 });
+            let record = retrieve(&mut client, &mut store, &letter, "by-id").await?;
+            authentication_progress.event(Event::DocumentComplete {
+                status: record.status.clone(),
+                media_kind: record
+                    .document
+                    .as_ref()
+                    .map(|document| document.media_kind.clone()),
+            });
+            let exit = if supported(&record) { 0 } else { 2 };
+            authentication_progress.finish_in_frontend(exit);
+            Ok((value(record)?, exit))
+        }
+        Command::Sync(args) => {
+            let use_paperless = args.paperless;
+            let args = ResolvedSyncArgs {
+                scope: args
+                    .scope
+                    .or_else(|| cli.selected_profile.as_ref().map(|p| p.scope))
+                    .ok_or(Error::Config(
+                        "supply --scope or use a profile saved by setup",
+                    ))?,
+                output: output(cli, args.output.as_deref())?,
+                page_size: args.page_size,
+                max_pages: args.max_pages,
+                max_documents: 100_000,
+            };
+            let (mut report, mut code) = sync(cli, &mut client, &mailbox, &args).await?;
+            if use_paperless {
+                match paperless_cli::deliver_saved(cli, Some(&args.output), 1000, 60).await {
+                    Ok((delivery, delivery_code)) => {
+                        report["paperless"] = delivery;
+                        report["paperless_exit_code"] = json!(delivery_code);
+                        if code == 0 {
+                            code = delivery_code;
+                        }
+                    }
+                    Err(error) => {
+                        report["paperless_error"] = json!(error.to_string());
+                        report["paperless_exit_code"] = json!(error.exit_code());
+                        if code == 0 {
+                            code = error.exit_code();
+                        }
+                    }
+                }
+            }
+            Ok((report, code))
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    let mut arguments: Vec<_> = std::env::args_os().collect();
+    let parsed = match Cli::try_parse_from(&arguments) {
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::MissingSubcommand
+                    | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) && !arguments.iter().any(|a| a == "--json") =>
+        {
+            if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+                let _ = Cli::command().print_help();
+                let _ = writeln!(io::stdout().lock());
+                return 0.into();
+            }
+            arguments.push("menu".into());
+            Cli::try_parse_from(arguments)
+        }
+        other => other,
+    };
+    let mut cli = match parsed {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            return if error.print().is_ok() {
+                0.into()
+            } else {
+                1.into()
+            };
+        }
+        Err(_) => {
+            // Clap diagnostics may echo unrecognized argument values. Never expose
+            // them: a caller could have accidentally supplied a secret as a flag.
+            let message = "invalid command line; use --help for usage";
+            let diagnostic = if std::env::args_os().any(|arg| arg == "--json") {
+                json!({"schema_version": 1, "status": "error", "exit_code": 2, "error": message})
+                    .to_string()
+            } else {
+                message.into()
+            };
+            let _ = writeln!(io::stderr().lock(), "{diagnostic}");
+            return 2.into();
+        }
+    };
+    if !matches!(cli.command, Command::Doctor(_) | Command::Menu)
+        && let Err(error) = load_profile(&mut cli)
+    {
+        return print_error(&cli, error);
+    }
+    if matches!(cli.command, Command::Menu) {
+        return match menu(&cli).await {
+            Ok(code) => code.into(),
+            Err(error) => print_error(&cli, error),
+        };
+    }
+    let missing = if cli.profile.is_none() {
+        match &cli.command {
+            Command::Login { .. } | Command::Logout => {
+                Some("login and logout require --profile with a saved profile")
+            }
+            Command::Sync(args) if args.scope.is_none() || args.output.is_none() => {
+                Some("sync requires --scope and --output, or a profile saved by setup")
+            }
+            Command::Inbox {
+                command: InboxCommand::Check(args),
+            } if args.output.is_none() && (!args.unread_only || args.sync_if_needed) => {
+                Some("inbox check needs --output or a profile, except standalone --unread-only")
+            }
+            Command::Download { output: None, .. } => {
+                Some("download requires --output, or a profile saved by setup")
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(message) = missing {
+        let diagnostic = if cli.json {
+            json!({"schema_version": 1, "status": "error", "exit_code": 2, "error": message})
+                .to_string()
+        } else {
+            message.into()
+        };
+        let _ = writeln!(io::stderr().lock(), "{diagnostic}");
+        return 2.into();
+    }
+
+    match execute(&mut cli).await {
+        Ok(code) => code.into(),
+        Err(error) => print_error(&cli, error),
+    }
+}
+
+async fn execute(cli: &mut Cli) -> Result<u8> {
+    let (data, code) = execute_report(cli).await?;
+    if let Some(data) = data {
+        if cli.json {
+            writeln!(
+                io::stdout().lock(),
+                "{}",
+                json!({"schema_version":1,"status":if code==0{"ok"}else{"partial"},"data":data})
+            )?;
+        } else {
+            let lines = if cli.details {
+                human_summary(cli, &data, code)
+            } else {
+                presentation::text(&presentation::report(cli, &data, code))
+            };
+            for line in lines {
+                writeln!(io::stdout().lock(), "{}", interactive::safe_line(&line))?;
+            }
+        }
+    }
+    Ok(code)
+}
+
+async fn execute_report(cli: &mut Cli) -> Result<(Option<Value>, u8)> {
+    if matches!(
+        cli.command,
+        Command::Setup { .. } | Command::Browse { .. } | Command::Login { .. }
+    ) {
+        if cli.json || cli.password_stdin || cli.non_interactive {
+            return Err(Error::Config(
+                "setup, browse and login need an interactive terminal; omit --json, --password-stdin and --non-interactive",
+            ));
+        }
+        if env_secret("EPOST_BEARER_TOKEN")?.is_some() || env_secret("EPOST_API_KEY")?.is_some() {
+            return Err(Error::Config(
+                "setup and browse use password sign-in; unset bearer/API-key variables or use the script commands",
+            ));
+        }
+        let code = if tui::available() {
+            interactive::run(cli, &mut tui::TuiPrompts::new()?).await
+        } else {
+            interactive::run(cli, &mut interactive::Terminal::new()?).await
+        }?;
+        return Ok((None, code));
+    }
+    let live = !cli.json
+        && !cli.no_progress
+        && tui::available()
+        && !matches!(
+            cli.command,
+            Command::Destination { .. }
+                | Command::Profile { .. }
+                | Command::Paperless {
+                    command: paperless_cli::PaperlessCommand::Setup { .. }
+                }
+        );
+    if live && !matches!(cli.command, Command::Doctor(_)) {
+        let needs_source = matches!(
+            cli.command,
+            Command::Check(_)
+                | Command::Status(_)
+                | Command::Sync(_)
+                | Command::Inbox { .. }
+                | Command::Archive { .. }
+                | Command::Show { .. }
+                | Command::Download { .. }
+                | Command::Tenants
+        );
+        if needs_source
+            && env_secret("EPOST_BEARER_TOKEN")?.is_none()
+            && env_secret("EPOST_API_KEY")?.is_none()
+        {
+            use interactive::Prompts;
+            let credentials = tui::TuiPrompts::new()?.credentials(cli);
+            match credentials {
+                Ok(value) => cli.prepared_credentials = Some(value),
+                Err(_) if matches!(cli.command, Command::Check(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let prepare = match &cli.command {
+            Command::Check(args) if !args.local => {
+                Some((args.destinations.clone(), args.output.clone()))
+            }
+            Command::Deliver(args) | Command::Verify(args) => {
+                Some((args.destinations.clone(), args.output.clone()))
+            }
+            Command::Reconcile(args) => Some((vec![args.destination.clone()], args.output.clone())),
+            _ => None,
+        };
+        if let Some((names, path)) = prepare {
+            destination_cli::prepare(cli, &names, path.as_deref())?;
+        }
+        let legacy_output = match &cli.command {
+            Command::Sync(args) if args.paperless => Some(args.output.clone()),
+            Command::Paperless {
+                command:
+                    paperless_cli::PaperlessCommand::Upload { output, .. }
+                    | paperless_cli::PaperlessCommand::Reconcile { output, .. },
+            } => Some(output.clone()),
+            _ => None,
+        };
+        if let Some(explicit) = legacy_output {
+            let (root, store) = destination_cli::open_store(cli, explicit.as_deref())?;
+            let target = epost_cli::delivery::load_target(&store)?;
+            let secret = paperless_cli::token(cli, &root, &store, &target)?;
+            cli.prepared_paperless_token = Some(paperless_cli::prepare_token(
+                &root, &store, &target, secret,
+            )?);
+        }
+        // All prompts happen before live progress owns the terminal.
+        cli.non_interactive = true;
+    }
+    let result = if live {
+        tui::operation(presentation::title(cli), operation_kind(cli), run(cli)).await
+    } else {
+        run(cli).await
+    };
+    let (data, code) = result?;
+    Ok((Some(data), code))
+}
+
+fn operation_kind(cli: &Cli) -> tui::OperationKind {
+    use tui::OperationKind as Kind;
+    match &cli.command {
+        Command::Check(args) => {
+            if args.local {
+                Kind::Retrieve
+            } else {
+                Kind::RetrieveAndDeliver
+            }
+        }
+        Command::Sync(args) => {
+            if args.paperless {
+                Kind::RetrieveAndDeliver
+            } else {
+                Kind::Retrieve
+            }
+        }
+        Command::Deliver(_) => Kind::Deliver,
+        Command::Verify(_) => Kind::Verify,
+        Command::Reconcile(_) => Kind::Reconcile,
+        Command::Doctor(_) => Kind::Doctor,
+        Command::Download { .. } => Kind::Retrieve,
+        Command::Inbox {
+            command: InboxCommand::Check(args),
+        } if args.sync_if_needed => Kind::Retrieve,
+        Command::Paperless {
+            command: paperless_cli::PaperlessCommand::Upload { .. },
+        } => Kind::Deliver,
+        Command::Paperless {
+            command: paperless_cli::PaperlessCommand::Reconcile { .. },
+        } => Kind::Reconcile,
+        _ => Kind::Inspect,
+    }
+}
+
+fn human_summary(cli: &Cli, data: &Value, code: u8) -> Vec<String> {
+    match &cli.command {
+        Command::Check(_)
+        | Command::Status(_)
+        | Command::Deliver(_)
+        | Command::Verify(_)
+        | Command::Reconcile(_)
+        | Command::Profile { .. } => modern::summary(data, code),
+        Command::Doctor(_) => doctor::summary(data),
+        Command::Destination { .. } => destination_cli::summary(data),
+        Command::Sync(_) => {
+            let mut lines = sync_summary(data, code);
+            lines.extend(paperless_cli::sync_lines(data));
+            lines
+        }
+        Command::Paperless { .. } => paperless_cli::summary(data, code),
+        Command::Inbox {
+            command: InboxCommand::Check(_),
+        } => check_summary(data, code),
+        _ => readable_metadata(data),
+    }
+}
+fn readable_metadata(data: &Value) -> Vec<String> {
+    if let Some(rows) = data.as_array().or_else(|| data["letters"].as_array()) {
+        let mut lines = vec![format!("{} items observed.", rows.len())];
+        for (i, row) in rows.iter().take(100).enumerate() {
+            let title = row["letterTitle"]
+                .as_str()
+                .or_else(|| row["directoryName"].as_str())
+                .or_else(|| row["company_name"].as_str())
+                .unwrap_or("Unnamed item");
+            lines.push(format!("{}. {}", i + 1, interactive::safe_line(title)));
+        }
+        if rows.len() > 100 {
+            lines.push("Use --json for the complete metadata result.".into());
+        }
+        return lines;
+    }
+    if let Some(status) = data["status"].as_str() {
+        return vec![format!("Document: {}.", interactive::safe_line(status))];
+    }
+    if data["password_forgotten"] == true {
+        return vec!["Saved ePost password forgotten. Mailbox settings retained.".into()];
+    }
+    vec!["Command finished. Use --json for structured metadata.".into()]
+}
+
+async fn menu(base: &Cli) -> Result<u8> {
+    if base.json || base.non_interactive || !io::stdin().is_terminal() {
+        return Err(Error::Config(
+            "open an interactive terminal for the menu; use epost check inbox --non-interactive for automation",
+        ));
+    }
+    let mut current = base.clone();
+    let mut last = 0;
+    loop {
+        current.command = Command::Menu;
+        current.selected_profile = None;
+        if let Err(error) = load_profile(&mut current) {
+            eprintln!("Startup needs attention: {error}. Doctor and Settings remain available.");
+            current.selected_profile = None;
+        }
+        let destinations = if current.selected_profile.is_some() {
+            match destination_cli::open_store(&current, None)
+                .and_then(|(_, store)| epost_cli::destinations::list(&store))
+            {
+                Ok(items) => items.into_iter().map(|d| d.name).collect(),
+                Err(error) => {
+                    eprintln!("Store needs attention: {error}. Open Doctor or Problems.");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let action = if tui::available() {
+            tui::home(
+                current.profile.as_deref(),
+                &destinations,
+                current.selected_profile.is_none(),
+            )?
+        } else {
+            use interactive::Prompts;
+            let mut ui = interactive::Terminal::new()?;
+            ui.line("1 Check inbox · 2 Inbox · 3 Archive · 4 Deliver · 5 Problems · 6 Doctor · 7 Destinations · 8 Setup · 9 Settings · q Quit")?;
+            match ui.input("Choose: ")?.as_deref() {
+                Some("1") => tui::MenuAction::CheckInbox,
+                Some("2") => tui::MenuAction::BrowseInbox,
+                Some("3") => tui::MenuAction::BrowseArchive,
+                Some("4") => tui::MenuAction::Deliver,
+                Some("5") => tui::MenuAction::Problems,
+                Some("6") => tui::MenuAction::Doctor,
+                Some("7") => tui::MenuAction::Destinations,
+                Some("8") => tui::MenuAction::Setup,
+                Some("9") => tui::MenuAction::Settings,
+                None => tui::MenuAction::Quit,
+                _ => continue,
+            }
+        };
+        let mut cli = current.clone();
+        cli.non_interactive = base.non_interactive;
+        cli.prepared_credentials = None;
+        cli.prepared_paperless_token = None;
+        cli.prepared_destination_tokens.clear();
+        cli.destinations_prepared = false;
+        cli.prepared_destination_failures.clear();
+        cli.command = match action {
+            tui::MenuAction::Quit => return Ok(last),
+            tui::MenuAction::Setup => {
+                cli.selected_profile = None;
+                Command::Setup {
+                    output: None,
+                    scope: Some(Scope::Inbox),
+                }
+            }
+            tui::MenuAction::CheckInbox => Command::Check(modern::ScopeArgs {
+                target: modern::Location::Inbox,
+                destinations: Vec::new(),
+                local: false,
+                limit: 1000,
+                output: None,
+            }),
+            tui::MenuAction::BrowseInbox => Command::Browse {
+                location: Some(modern::Location::Inbox),
+                output: None,
+                page_size: 10,
+            },
+            tui::MenuAction::BrowseArchive => Command::Browse {
+                location: Some(modern::Location::Archive),
+                output: None,
+                page_size: 10,
+            },
+            tui::MenuAction::Deliver => Command::Deliver(modern::DeliveryArgs {
+                destinations: Vec::new(),
+                limit: 1000,
+                output: None,
+            }),
+            tui::MenuAction::Doctor | tui::MenuAction::Problems => {
+                Command::Doctor(doctor::DoctorArgs {
+                    destinations: Vec::new(),
+                    offline: matches!(action, tui::MenuAction::Problems),
+                })
+            }
+            tui::MenuAction::Destinations => {
+                use interactive::Prompts;
+                let answer = if tui::available() {
+                    tui::TuiPrompts::new()?.prompt(
+                        "Destinations: list / add / edit NAME / remove NAME: ",
+                        false,
+                    )?
+                } else {
+                    interactive::Terminal::new()?
+                        .input("Destinations: list / add / edit NAME / remove NAME: ")?
+                };
+                let Some(answer) = answer else { continue };
+                let words = answer.split_whitespace().collect::<Vec<_>>();
+                let command = match words.as_slice() {
+                    ["list"] | [] => destination_cli::DestinationCommand::List,
+                    ["add"] => destination_cli::DestinationCommand::Add {
+                        name: None,
+                        folder: None,
+                        url: None,
+                    },
+                    ["edit", name] => destination_cli::DestinationCommand::Edit {
+                        name: (*name).into(),
+                    },
+                    ["remove", name] => destination_cli::DestinationCommand::Remove {
+                        name: (*name).into(),
+                        yes: false,
+                    },
+                    _ => {
+                        eprintln!("Choose list, add, edit NAME or remove NAME.");
+                        continue;
+                    }
+                };
+                Command::Destination { command }
+            }
+            tui::MenuAction::Settings => {
+                use interactive::Prompts;
+                let answer = if tui::available() {
+                    tui::TuiPrompts::new()?.prompt(
+                        "Settings: profiles / use NAME / setup / login / login remember / logout: ",
+                        false,
+                    )?
+                } else {
+                    interactive::Terminal::new()?.input(
+                        "Settings: profiles / use NAME / setup / login / login remember / logout: ",
+                    )?
+                };
+                let Some(answer) = answer else { continue };
+                let words = answer.split_whitespace().collect::<Vec<_>>();
+                match words.as_slice() {
+                    ["profiles"] => Command::Profile {
+                        command: modern::ProfileCommand::List,
+                    },
+                    ["use", name] => Command::Profile {
+                        command: modern::ProfileCommand::Use {
+                            name: (*name).into(),
+                        },
+                    },
+                    ["setup"] => {
+                        cli.selected_profile = None;
+                        Command::Setup {
+                            output: None,
+                            scope: Some(Scope::Inbox),
+                        }
+                    }
+                    ["login"] => Command::Login { remember: false },
+                    ["login", "remember"] => Command::Login { remember: true },
+                    ["logout"] => Command::Logout,
+                    _ => {
+                        eprintln!(
+                            "Choose profiles, use NAME, setup, login, login remember or logout."
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+        loop {
+            // Never carry an operation's cached credentials into a retry or Doctor.
+            cli.non_interactive = base.non_interactive;
+            cli.prepared_credentials = None;
+            cli.prepared_paperless_token = None;
+            cli.prepared_destination_tokens.clear();
+            cli.destinations_prepared = false;
+            cli.prepared_destination_failures.clear();
+            let view = match execute_report(&mut cli).await {
+                Ok((data, code)) => {
+                    last = code;
+                    if code == 0
+                        && let Command::Profile {
+                            command: modern::ProfileCommand::Use { name },
+                        } = &cli.command
+                    {
+                        current.profile = Some(name.clone());
+                    }
+                    data.map(|data| presentation::report(&cli, &data, code))
+                        .unwrap_or_else(|| {
+                            presentation::report(&cli, &json!({"status":"session ended"}), code)
+                        })
+                }
+                Err(error) => {
+                    last = error.exit_code();
+                    presentation::error(&cli, &error)
+                }
+            };
+            let action = if tui::available() {
+                tui::result(&view)?
+            } else {
+                for line in presentation::text(&view) {
+                    writeln!(io::stdout().lock(), "{line}")?;
+                }
+                use interactive::Prompts;
+                match interactive::Terminal::new()?
+                    .input("Enter menu · r retry · g Doctor · q quit: ")?
+                    .as_deref()
+                {
+                    Some("r") => tui::ResultAction::Retry,
+                    Some("g") => tui::ResultAction::Doctor,
+                    None => tui::ResultAction::Quit,
+                    _ => tui::ResultAction::Back,
+                }
+            };
+            match action {
+                tui::ResultAction::Back => break,
+                tui::ResultAction::Quit => return Ok(last),
+                tui::ResultAction::Retry => {}
+                tui::ResultAction::Doctor => {
+                    cli.command = Command::Doctor(doctor::DoctorArgs {
+                        destinations: Vec::new(),
+                        offline: false,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn print_error(cli: &Cli, error: Error) -> std::process::ExitCode {
+    let code = error.exit_code();
+    let diagnostic = if cli.json {
+        json!({"schema_version": 1, "status": "error", "exit_code": code, "error": error.to_string()}).to_string()
+    } else {
+        error.to_string()
+    };
+    let _ = writeln!(io::stderr().lock(), "{diagnostic}");
+    code.into()
+}
+
+#[cfg(test)]
+mod check_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_conditional_sync_preserves_the_completed_partial_check() {
+        let mut report = json!({"has_new":true,"pagination_complete":false,"check_exit_code":2});
+        let exit = attach_check_sync(&mut report, 2, Err(Error::Network));
+        assert_eq!(exit, 2);
+        assert_eq!(report["has_new"], true);
+        assert_eq!(report["pagination_complete"], false);
+        assert_eq!(report["sync_exit_code"], 1);
+        assert_eq!(report["sync_error"], "network request failed or timed out");
+        assert!(
+            check_summary(&report, exit)
+                .iter()
+                .any(|s| s.contains("Check/sync needs attention (exit 2)"))
+        );
+        let exit = attach_check_sync(
+            &mut report,
+            2,
+            Err(Error::Storage("saved document is corrupt")),
+        );
+        assert_eq!(exit, 4);
+    }
+
+    #[test]
+    fn successful_conditional_sync_does_not_hide_check_uncertainty() {
+        let mut report = json!({"check_exit_code":2});
+        let exit = attach_check_sync(
+            &mut report,
+            2,
+            Ok((json!({"documents":[],"pagination_complete":true}), 0)),
+        );
+        assert_eq!(exit, 2);
+        let lines = check_summary(&report, exit);
+        assert!(
+            lines
+                .iter()
+                .any(|s| s.contains("Check/sync needs attention (exit 2)"))
+        );
+        assert_eq!(report["sync_exit_code"], 0);
+    }
+}

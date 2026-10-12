@@ -1,0 +1,48 @@
+[package]
+name = "epost-cli"
+version = "0.2.1"
+edition = "2024"
+rust-version = "1.98"
+description = "Unofficial read-only ePost inbox and archive retrieval CLI"
+license = "MIT"
+repository = "https://github.com/corvaglia-io/epost-cli"
+publish = false
+
+[lib]
+name = "epost_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "epost-cli"
+path = "src/main.rs"
+
+[[bin]]
+name = "epost"
+path = "src/epost.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+fs2 = "0.4"
+hex = "0.4"
+httpdate = "1"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+zeroize = "1"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7", default-features = false }
+
+[dev-dependencies]
+wiremock = "0.6"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
