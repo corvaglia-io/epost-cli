@@ -24,6 +24,12 @@ repeat `--destination NAME` to restrict one run, or use `--local` for local retr
 See the [command map and migration guide](docs/commands.md) for setup,
 multiple accounts, verified folder copies, resuming delivery and Doctor.
 
+The progress dashboard shows workflow stages, separate retrieval/destination
+counters and a short activity feed. Scanning uses an unknown-total spinner;
+bars show only the current observed inventory or local destination's processed
+items. Press `d` for the detailed activity log. No whole-mailbox percentage or
+artificial wait is added.
+
 ## Scope
 
 - Explicit private/business mailbox selection and tenant discovery.

@@ -67,7 +67,18 @@ mailbox coverage. Registered letters needing acceptance require action in ePost.
 
 ## Display and automation
 
-On a capable terminal, commands show Ratatui progress, restore the terminal,
+On a capable terminal, commands show Ratatui progress with stages, separate
+source/destination counters and a compact activity feed, then restore the terminal.
+During scanning, totals remain unknown and the screen shows a spinner and page
+observations. After an inventory or local destination total is known, its bar
+shows items checked or processed in that batch. It is not an overall mailbox
+percentage and does not turn partial work into successful retrieval. Multiple
+archive inventories and destinations reset their own bars, retaining source
+counters separately. Press `d` during progress to view the bounded detailed log;
+press it again to return to the dashboard. Cached runs may finish immediately;
+the UI adds no artificial delays.
+
+After progress, standalone commands
 print a compact text summary and exit. In the menu, a lasting result screen
 separates retrieval, destinations and issues, with a next step for each problem.
 Enter returns to the menu; `r` explicitly retries, `g` opens Doctor, `d` shows

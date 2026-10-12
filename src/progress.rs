@@ -4,17 +4,151 @@
 //! IDs, account details or authenticated response bodies. A broken progress
 //! output stream must not interrupt retrieval or change its result.
 
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::{
-    Mutex,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc::{self, Receiver, SyncSender, TrySendError},
 };
 
 const BUFFERED_LINES: usize = 256;
+const TELEMETRY_SLOTS: usize = 7;
 static NEXT_OBSERVER: AtomicU64 = AtomicU64::new(1);
-static OBSERVER: Mutex<Option<(u64, SyncSender<String>)>> = Mutex::new(None);
+static OBSERVER: Mutex<Option<(u64, Arc<Mutex<Stream>>)>> = Mutex::new(None);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// A redacted line and optional typed state for alternative frontends. Counts
+/// are authoritative snapshots; renderers must assign them rather than add them.
+#[derive(Clone, Debug)]
+pub struct Update {
+    pub line: String,
+    pub telemetry: Option<Telemetry>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Telemetry {
+    Retrieval {
+        event: Event,
+        counts: RetrievalCounts,
+    },
+    DestinationStarted {
+        name: String,
+        index: usize,
+        total: usize,
+        audit: bool,
+    },
+    Delivery(crate::delivery::DeliveryEvent),
+    Diagnostic {
+        component: String,
+        status: DiagnosticStatus,
+    },
+}
+
+/// Disjoint source outcomes. `other` includes newly saved and reused non-PDF
+/// content; `reused_pdf` never counts a cached file needing format review.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetrievalCounts {
+    pub new_pdf: usize,
+    pub reused_pdf: usize,
+    pub other: usize,
+    pub pending: usize,
+    pub failed: usize,
+    pub deferred: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagnosticStatus {
+    Ok,
+    Warning,
+    Error,
+    NotChecked,
+}
+
+struct BufferedUpdate {
+    sequence: u64,
+    update: Update,
+}
+
+struct Stream {
+    queue: VecDeque<Update>,
+    latest: [Option<BufferedUpdate>; TELEMETRY_SLOTS],
+    sequence: u64,
+}
+
+impl Stream {
+    fn new() -> Self {
+        Self {
+            queue: VecDeque::with_capacity(BUFFERED_LINES),
+            latest: std::array::from_fn(|_| None),
+            sequence: 0,
+        }
+    }
+
+    fn push(&mut self, update: Update) {
+        self.sequence = self.sequence.saturating_add(1);
+        if self.queue.len() < BUFFERED_LINES && self.latest.iter().all(Option::is_none) {
+            self.queue.push_back(update);
+        } else if let Some(telemetry) = &update.telemetry {
+            let domain = match telemetry {
+                Telemetry::Retrieval {
+                    event: Event::InventoryStarted { .. },
+                    ..
+                } => {
+                    self.latest[1] = None;
+                    self.latest[2] = None;
+                    self.latest[3] = None;
+                    0
+                }
+                Telemetry::Retrieval {
+                    event: Event::InventoryComplete { .. },
+                    ..
+                } => 1,
+                Telemetry::Retrieval {
+                    event: Event::DocumentStarted { .. },
+                    ..
+                } => {
+                    self.latest[3] = None;
+                    2
+                }
+                Telemetry::Retrieval { event, .. } => {
+                    if matches!(event, Event::Authenticating) {
+                        self.latest[0] = None;
+                        self.latest[1] = None;
+                        self.latest[2] = None;
+                    }
+                    3
+                }
+                Telemetry::DestinationStarted { .. } => {
+                    self.latest[5] = None;
+                    4
+                }
+                Telemetry::Delivery(_) => 5,
+                Telemetry::Diagnostic { .. } => 6,
+            };
+            self.latest[domain] = Some(BufferedUpdate {
+                sequence: self.sequence,
+                update,
+            });
+        }
+        // Line-only overflow retains the historical drop behavior. Typed
+        // overflow keeps bounded state, including the current retrieval batch,
+        // inventory certainty and document landmarks. Never wait for capacity
+        // or lose the active destination to a delivery update.
+    }
+
+    fn pop(&mut self) -> Option<Update> {
+        self.queue.pop_front().or_else(|| {
+            let domain = self
+                .latest
+                .iter()
+                .enumerate()
+                .filter_map(|(domain, entry)| entry.as_ref().map(|item| (domain, item.sequence)))
+                .min_by_key(|(_, sequence)| *sequence)
+                .map(|(domain, _)| domain)?;
+            self.latest[domain].take().map(|item| item.update)
+        })
+    }
+}
 
 /// Requests a cooperative stop between requests. Never discard an in-flight
 /// upload: the workflow must preserve its result and recovery journal first.
@@ -36,13 +170,21 @@ pub fn reset_stop() {
 /// reporting. Only a frontend actively displaying progress should subscribe.
 pub struct Subscription {
     id: u64,
-    receiver: Receiver<String>,
+    stream: Arc<Mutex<Stream>>,
 }
 
 impl Subscription {
     /// Poll without blocking the async operation or terminal input loop.
     pub fn try_recv(&self) -> Option<String> {
-        self.receiver.try_recv().ok()
+        self.try_update().map(|update| update.line)
+    }
+
+    /// Poll typed state with the same line as the plain progress reporter.
+    /// After overflow, queued lines precede the latest snapshots in publication
+    /// order. At most seven overflow snapshots retain the latest state and the
+    /// current inventory/document landmarks, without duplicate event replay.
+    pub fn try_update(&self) -> Option<Update> {
+        self.stream.lock().ok()?.pop()
     }
 }
 
@@ -64,9 +206,9 @@ pub fn subscribe() -> Option<Subscription> {
         return None;
     }
     let id = NEXT_OBSERVER.fetch_add(1, Ordering::Relaxed);
-    let (sender, receiver) = mpsc::sync_channel(BUFFERED_LINES);
-    *observer = Some((id, sender));
-    Some(Subscription { id, receiver })
+    let stream = Arc::new(Mutex::new(Stream::new()));
+    *observer = Some((id, Arc::clone(&stream)));
+    Some(Subscription { id, stream })
 }
 
 /// Publishes a fixed, redacted human progress line when a frontend is active.
@@ -74,24 +216,35 @@ pub fn subscribe() -> Option<Subscription> {
 /// never supply titles, document/account IDs, secrets or response bodies.
 /// Excess updates are dropped, never printed over an active terminal view.
 pub fn publish_line(line: &str) -> bool {
-    let Ok(mut observer) = OBSERVER.lock() else {
+    publish(Update {
+        line: safe_line(line),
+        telemetry: None,
+    })
+}
+
+/// Publishes typed, normalized state alongside its existing human line. Names
+/// and labels must be fixed workflow labels or configured destination names,
+/// never document/account identifiers, secrets or provider response text.
+/// Returns false when the caller should write its existing line to stderr.
+pub fn publish_update(telemetry: Telemetry, line: &str) -> bool {
+    publish(Update {
+        line: safe_line(line),
+        telemetry: Some(normalize_telemetry(telemetry)),
+    })
+}
+
+fn publish(update: Update) -> bool {
+    let Ok(observer) = OBSERVER.lock() else {
         return false;
     };
-    let Some((_, sender)) = observer.as_ref() else {
+    let Some((_, stream)) = observer.as_ref() else {
         return false;
     };
-    let line = line
-        .chars()
-        .filter(|character| safe_character(*character))
-        .take(512)
-        .collect();
-    match sender.try_send(line) {
-        Ok(()) | Err(TrySendError::Full(_)) => true,
-        Err(TrySendError::Disconnected(_)) => {
-            *observer = None;
-            false
-        }
-    }
+    let Ok(mut stream) = stream.lock() else {
+        return false;
+    };
+    stream.push(update);
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,7 +275,7 @@ pub enum Event {
     },
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct Counts {
     pdf: usize,
     json: usize,
@@ -149,10 +302,49 @@ impl Reporter {
 
     /// Emits one complete line on stderr, ignoring any output failure.
     pub fn event(&mut self, event: Event) {
-        if let Some(line) = self.render(event)
-            && !publish_line(&line)
-        {
-            let _ = writeln!(io::stderr().lock(), "{line}");
+        if !self.enabled {
+            return;
+        }
+        let event = normalize_event(event);
+        let final_counts = matches!(event, Event::Finished { .. }).then(|| self.counts.telemetry());
+        if let Some(line) = self.render(event.clone()) {
+            let telemetry = Telemetry::Retrieval {
+                event,
+                counts: final_counts.unwrap_or_else(|| self.counts.telemetry()),
+            };
+            if !publish_update(telemetry, &line) {
+                let _ = writeln!(io::stderr().lock(), "{line}");
+            }
+        }
+    }
+
+    /// Completes the source stage only for an active frontend. Returns false
+    /// without changing counts or writing stderr when reporting is disabled or
+    /// no frontend is displaying progress. A successful publication resets the
+    /// count sequence after preserving its final authoritative snapshot.
+    pub fn finish_in_frontend(&mut self, exit_code: u8) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let event = Event::Finished { exit_code };
+        let mut snapshot = Self {
+            enabled: true,
+            counts: self.counts,
+        };
+        let Some(line) = snapshot.render(event.clone()) else {
+            return false;
+        };
+        if publish_update(
+            Telemetry::Retrieval {
+                event,
+                counts: self.counts.telemetry(),
+            },
+            &line,
+        ) {
+            self.reset();
+            true
+        } else {
+            false
         }
     }
 
@@ -231,6 +423,10 @@ impl Reporter {
                     self.counts.deferred += 1;
                     "  Deferred because sign-in failed.".into()
                 }
+                "deferred_limit" => {
+                    self.counts.deferred += 1;
+                    "  Deferred by the download limit.".into()
+                }
                 _ => {
                     // Do not echo unrecognized status text supplied by a caller.
                     self.counts.deferred += 1;
@@ -255,6 +451,20 @@ impl Reporter {
 }
 
 impl Counts {
+    fn telemetry(&self) -> RetrievalCounts {
+        RetrievalCounts {
+            new_pdf: self.pdf,
+            reused_pdf: self.reused.saturating_sub(self.reused_other),
+            other: self
+                .json
+                .saturating_add(self.binary)
+                .saturating_add(self.reused_other),
+            pending: self.pending,
+            failed: self.failed,
+            deferred: self.deferred,
+        }
+    }
+
     fn summary(&self) -> String {
         let counts = [
             (self.pdf, "PDF saved"),
@@ -277,6 +487,62 @@ impl Counts {
             nonzero.join(", ")
         }
     }
+}
+
+fn normalize_telemetry(telemetry: Telemetry) -> Telemetry {
+    match telemetry {
+        Telemetry::Retrieval { event, counts } => Telemetry::Retrieval {
+            event: normalize_event(event),
+            counts,
+        },
+        Telemetry::DestinationStarted {
+            name,
+            index,
+            total,
+            audit,
+        } => Telemetry::DestinationStarted {
+            name: safe_label(&name),
+            index,
+            total,
+            audit,
+        },
+        Telemetry::Diagnostic { component, status } => Telemetry::Diagnostic {
+            component: safe_label(&component),
+            status,
+        },
+        Telemetry::Delivery(event) => Telemetry::Delivery(event),
+    }
+}
+
+fn normalize_event(event: Event) -> Event {
+    match event {
+        Event::InventoryStarted { label } => Event::InventoryStarted {
+            label: safe_label(&label),
+        },
+        Event::DocumentComplete { status, media_kind } => Event::DocumentComplete {
+            status: match status.as_str() {
+                "saved_pdf"
+                | "saved_json"
+                | "saved_binary"
+                | "already_saved"
+                | "awaiting_manual_acceptance_or_status_verification"
+                | "failed"
+                | "deferred_due_to_authentication_failure"
+                | "deferred_limit" => status,
+                _ => "unrecognized".into(),
+            },
+            media_kind: media_kind
+                .filter(|kind| matches!(kind.as_str(), "pdf" | "json" | "binary")),
+        },
+        other => other,
+    }
+}
+
+fn safe_line(line: &str) -> String {
+    line.chars()
+        .filter(|character| safe_character(*character))
+        .take(512)
+        .collect()
 }
 
 fn safe_label(label: &str) -> String {

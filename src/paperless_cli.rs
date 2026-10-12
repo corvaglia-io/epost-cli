@@ -455,6 +455,17 @@ pub(super) async fn deliver_saved(
     }
     let target = delivery::load_target(&store)?;
     let client = make_client(cli, &target.url, token(cli, &root, &store, &target)?)?;
+    if progress_enabled(cli) {
+        epost_cli::progress::publish_update(
+            epost_cli::progress::Telemetry::DestinationStarted {
+                name: "Paperless".into(),
+                index: 1,
+                total: 1,
+                audit: false,
+            },
+            "Paperless: checking destination access",
+        );
+    }
     validate_tags(&client, &target).await?;
     let options = DeliveryOptions {
         max_documents: limit,
@@ -476,6 +487,10 @@ pub(super) async fn deliver_saved(
 }
 
 pub(super) fn show_progress(cli: &Cli, event: DeliveryEvent) {
+    show_destination_progress(cli, event, "Paperless");
+}
+
+pub(super) fn show_destination_progress(cli: &Cli, event: DeliveryEvent, label: &str) {
     if !progress_enabled(cli) {
         return;
     }
@@ -488,10 +503,11 @@ pub(super) fn show_progress(cli: &Cli, event: DeliveryEvent) {
         DeliveryPhase::Finished => "finished",
     };
     let line = format!(
-        "Paperless: {phase} ({}/{}, {} verified, {} need attention)",
+        "{label}: {phase} ({}/{}, {} verified, {} need attention)",
         event.processed, event.total, event.delivered, event.attention
     );
-    if !epost_cli::progress::publish_line(&line) {
+    if !epost_cli::progress::publish_update(epost_cli::progress::Telemetry::Delivery(event), &line)
+    {
         let _ = writeln!(io::stderr().lock(), "{line}");
     }
 }

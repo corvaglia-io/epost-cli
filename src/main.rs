@@ -792,7 +792,14 @@ async fn sync(
     let result = sync_with_progress(cli, client, mailbox, args, &mut reporter).await;
     // TTY and guided views own the final human summary. JSON/pipe users can
     // opt into a single progress summary on stderr while stdout stays machine-readable.
-    if matches!(cli.command, Command::Sync(_)) && (cli.json || !io::stdout().is_terminal()) {
+    let source_code = match &result {
+        Ok((_, code)) => *code,
+        Err(error) => error.exit_code(),
+    };
+    if !reporter.finish_in_frontend(source_code)
+        && matches!(cli.command, Command::Sync(_))
+        && (cli.json || !io::stdout().is_terminal())
+    {
         reporter.event(Event::Finished {
             exit_code: match &result {
                 Ok((_, code)) => *code,
@@ -992,6 +999,14 @@ async fn sync_with_progress(
                 None => false,
             };
             if !already && !registered_pending(letter) && attempts >= args.max_documents {
+                reporter.event(Event::DocumentStarted {
+                    index: index + 1,
+                    total: inventory.letters.len(),
+                });
+                reporter.event(Event::DocumentComplete {
+                    status: "deferred_limit".into(),
+                    media_kind: None,
+                });
                 report.documents.push(Retrieval {
                     letter_id: letter.id.clone(),
                     source: source.label(),
@@ -1074,8 +1089,26 @@ async fn check_inbox(
     } else {
         let destination = output(cli, args.output.as_deref())?;
         let store = Store::open(&destination, &namespace(cli, mailbox)?)?;
-        let inventory =
-            pagination::collect(client, Source::Inbox, args.page_size, args.max_pages).await?;
+        let mut reporter = Reporter::new(progress_enabled(cli));
+        reporter.event(Event::InventoryStarted {
+            label: "inbox".into(),
+        });
+        let inventory = pagination::collect_with_progress(
+            client,
+            Source::Inbox,
+            args.page_size,
+            args.max_pages,
+            |event| {
+                if let pagination::PageProgress::Started { page, documents } = event {
+                    reporter.event(Event::Page { page, documents });
+                }
+            },
+        )
+        .await?;
+        reporter.event(Event::InventoryComplete {
+            documents: inventory.letters.len(),
+            complete: inventory.pagination_complete,
+        });
         let mut unread = 0;
         let mut unknown_read = 0;
         let mut unsaved = 0;
@@ -1160,7 +1193,11 @@ async fn check_inbox(
             &mut reporter,
         )
         .await;
-        if cli.json || !io::stdout().is_terminal() {
+        let source_code = match &result {
+            Ok((_, code)) => *code,
+            Err(error) => error.exit_code(),
+        };
+        if !reporter.finish_in_frontend(source_code) && (cli.json || !io::stdout().is_terminal()) {
             reporter.event(Event::Finished {
                 exit_code: match &result {
                     Ok((_, code)) => *code,
@@ -1301,14 +1338,18 @@ async fn run(cli: &Cli) -> Result<(Value, u8)> {
     }
     let mailbox = mailbox(cli)?;
     let mut client = client(cli, Some(mailbox.clone()))?;
-    let mut authentication_progress =
-        Reporter::new(matches!(cli.command, Command::Sync(_)) && progress_enabled(cli));
+    let mut authentication_progress = Reporter::new(progress_enabled(cli));
     authentication_progress.event(Event::Authenticating);
     if let Err(error) = authenticate(cli, &mut client, &mailbox).await {
         authentication_progress.event(Event::Finished {
             exit_code: error.exit_code(),
         });
         return Err(error);
+    }
+    if matches!(operation_kind(cli), tui::OperationKind::Inspect) {
+        authentication_progress.event(Event::InventoryStarted {
+            label: "mailbox metadata".into(),
+        });
     }
     match &cli.command {
         Command::Setup { .. }
@@ -1364,8 +1405,24 @@ async fn run(cli: &Cli) -> Result<(Value, u8)> {
                     "letter ID does not match requested ID",
                 ));
             }
+            authentication_progress.event(Event::InventoryStarted {
+                label: "selected document".into(),
+            });
+            authentication_progress.event(Event::InventoryComplete {
+                documents: 1,
+                complete: true,
+            });
+            authentication_progress.event(Event::DocumentStarted { index: 1, total: 1 });
             let record = retrieve(&mut client, &mut store, &letter, "by-id").await?;
+            authentication_progress.event(Event::DocumentComplete {
+                status: record.status.clone(),
+                media_kind: record
+                    .document
+                    .as_ref()
+                    .map(|document| document.media_kind.clone()),
+            });
             let exit = if supported(&record) { 0 } else { 2 };
+            authentication_progress.finish_in_frontend(exit);
             Ok((value(record)?, exit))
         }
         Command::Sync(args) => {
@@ -1615,12 +1672,47 @@ async fn execute_report(cli: &mut Cli) -> Result<(Option<Value>, u8)> {
         cli.non_interactive = true;
     }
     let result = if live {
-        tui::operation("ePost", run(cli)).await
+        tui::operation(presentation::title(cli), operation_kind(cli), run(cli)).await
     } else {
         run(cli).await
     };
     let (data, code) = result?;
     Ok((Some(data), code))
+}
+
+fn operation_kind(cli: &Cli) -> tui::OperationKind {
+    use tui::OperationKind as Kind;
+    match &cli.command {
+        Command::Check(args) => {
+            if args.local {
+                Kind::Retrieve
+            } else {
+                Kind::RetrieveAndDeliver
+            }
+        }
+        Command::Sync(args) => {
+            if args.paperless {
+                Kind::RetrieveAndDeliver
+            } else {
+                Kind::Retrieve
+            }
+        }
+        Command::Deliver(_) => Kind::Deliver,
+        Command::Verify(_) => Kind::Verify,
+        Command::Reconcile(_) => Kind::Reconcile,
+        Command::Doctor(_) => Kind::Doctor,
+        Command::Download { .. } => Kind::Retrieve,
+        Command::Inbox {
+            command: InboxCommand::Check(args),
+        } if args.sync_if_needed => Kind::Retrieve,
+        Command::Paperless {
+            command: paperless_cli::PaperlessCommand::Upload { .. },
+        } => Kind::Deliver,
+        Command::Paperless {
+            command: paperless_cli::PaperlessCommand::Reconcile { .. },
+        } => Kind::Reconcile,
+        _ => Kind::Inspect,
+    }
 }
 
 fn human_summary(cli: &Cli, data: &Value, code: u8) -> Vec<String> {

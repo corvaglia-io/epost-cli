@@ -1,11 +1,508 @@
 use epost_cli::api::{ApiClient, ClientOptions};
+use epost_cli::delivery::{DeliveryEvent, DeliveryPhase};
 use epost_cli::models::{Mailbox, MailboxKind};
 use epost_cli::pagination::{PageProgress, Source, collect_with_progress};
-use epost_cli::progress::{Event, Reporter};
+use epost_cli::progress::{
+    DiagnosticStatus, Event, Reporter, RetrievalCounts, Telemetry, Update, publish_line,
+    publish_update, subscribe,
+};
 use epost_cli::secret::Secret;
 use serde_json::{Value, json};
+use std::sync::Mutex;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+// Subscription is intentionally process-wide and exclusive. Keep capture tests
+// independent from the test runner's scheduling; render-only tests need no lock.
+static CAPTURE_TEST: Mutex<()> = Mutex::new(());
+
+fn retrieval(update: Update) -> (String, Event, RetrievalCounts) {
+    let Some(Telemetry::Retrieval { event, counts }) = update.telemetry else {
+        panic!("expected typed retrieval progress");
+    };
+    (update.line, event, counts)
+}
+
+#[test]
+fn typed_progress_matches_plain_lines_and_counts_disjoint_outcomes() {
+    let _guard = CAPTURE_TEST.lock().unwrap();
+    let capture = subscribe().unwrap();
+    let mut reporter = Reporter::new(true);
+    let mut plain = Reporter::new(true);
+    let mut expected = RetrievalCounts::default();
+    for (status, media, count) in [
+        ("saved_pdf", Some("pdf"), 0),
+        ("already_saved", Some("pdf"), 1),
+        ("saved_json", Some("json"), 2),
+        ("saved_binary", Some("binary"), 2),
+        ("already_saved", Some("json"), 2),
+        ("already_saved", Some("binary"), 2),
+        ("already_saved", None, 2),
+        ("awaiting_manual_acceptance_or_status_verification", None, 3),
+        ("failed", None, 4),
+        ("deferred_due_to_authentication_failure", None, 5),
+        ("deferred_limit", None, 5),
+    ] {
+        let event = Event::DocumentComplete {
+            status: status.into(),
+            media_kind: media.map(str::to_owned),
+        };
+        let expected_line = plain.render(event.clone()).unwrap();
+        reporter.event(event.clone());
+        match count {
+            0 => expected.new_pdf += 1,
+            1 => expected.reused_pdf += 1,
+            2 => expected.other += 1,
+            3 => expected.pending += 1,
+            4 => expected.failed += 1,
+            5 => expected.deferred += 1,
+            _ => unreachable!(),
+        }
+        let (line, actual_event, counts) = retrieval(capture.try_update().unwrap());
+        assert_eq!(line, expected_line);
+        assert_eq!(actual_event, event);
+        assert_eq!(counts, expected);
+    }
+    reporter.event(Event::Finished { exit_code: 2 });
+    let (line, event, counts) = retrieval(capture.try_update().unwrap());
+    assert_eq!(
+        line,
+        plain.render(Event::Finished { exit_code: 2 }).unwrap()
+    );
+    assert_eq!(event, Event::Finished { exit_code: 2 });
+    assert_eq!(counts, expected, "Finished retains the pre-reset snapshot");
+
+    reporter.event(Event::Authenticating);
+    assert_eq!(
+        retrieval(capture.try_update().unwrap()).2,
+        RetrievalCounts::default()
+    );
+    reporter.event(Event::DocumentComplete {
+        status: "saved_pdf".into(),
+        media_kind: Some("pdf".into()),
+    });
+    assert_eq!(retrieval(capture.try_update().unwrap()).2.new_pdf, 1);
+    reporter.reset();
+    assert!(capture.try_update().is_none(), "reset is silent");
+    reporter.event(Event::Finished { exit_code: 0 });
+    assert_eq!(
+        retrieval(capture.try_update().unwrap()).2,
+        RetrievalCounts::default()
+    );
+}
+
+#[test]
+fn disabled_reporter_publishes_neither_lines_nor_telemetry() {
+    let _guard = CAPTURE_TEST.lock().unwrap();
+    let capture = subscribe().unwrap();
+    let mut reporter = Reporter::new(false);
+    for event in [
+        Event::Authenticating,
+        Event::DocumentComplete {
+            status: "saved_pdf".into(),
+            media_kind: Some("pdf".into()),
+        },
+        Event::Finished { exit_code: 0 },
+    ] {
+        reporter.event(event);
+    }
+    assert!(!reporter.finish_in_frontend(0));
+    assert!(capture.try_update().is_none());
+}
+
+#[test]
+fn frontend_finish_preserves_plain_counts_without_an_observer_and_resets_on_success() {
+    let _guard = CAPTURE_TEST.lock().unwrap();
+    let mut reporter = Reporter::new(true);
+    reporter.render(Event::DocumentComplete {
+        status: "saved_pdf".into(),
+        media_kind: Some("pdf".into()),
+    });
+    assert!(!reporter.finish_in_frontend(2));
+    let capture = subscribe().unwrap();
+    assert!(capture.try_update().is_none());
+    assert!(reporter.finish_in_frontend(2));
+    let (line, event, counts) = retrieval(capture.try_update().unwrap());
+    assert_eq!(
+        line,
+        "Sync finished with items requiring attention: 1 PDF saved."
+    );
+    assert_eq!(event, Event::Finished { exit_code: 2 });
+    assert_eq!(counts.new_pdf, 1);
+    drop(capture);
+    assert!(!reporter.finish_in_frontend(0));
+    assert_eq!(
+        reporter.render(Event::Finished { exit_code: 0 }),
+        Some("Sync finished: no documents processed.".into())
+    );
+}
+
+#[test]
+fn typed_payloads_exclude_arbitrary_status_media_and_terminal_controls() {
+    let _guard = CAPTURE_TEST.lock().unwrap();
+    let capture = subscribe().unwrap();
+    let mut reporter = Reporter::new(true);
+    reporter.event(Event::DocumentComplete {
+        status: "synthetic-private-body\n\x1b\u{202e}".into(),
+        media_kind: Some("synthetic-private-media".into()),
+    });
+    let update = capture.try_update().unwrap();
+    assert!(!format!("{update:?}").contains("synthetic-private"));
+    let (_, event, counts) = retrieval(update);
+    assert_eq!(
+        event,
+        Event::DocumentComplete {
+            status: "unrecognized".into(),
+            media_kind: None,
+        }
+    );
+    assert_eq!(counts.deferred, 1);
+    reporter.event(Event::DocumentComplete {
+        status: "already_saved".into(),
+        media_kind: Some("synthetic-private-media".into()),
+    });
+    let (_, event, counts) = retrieval(capture.try_update().unwrap());
+    assert_eq!(
+        event,
+        Event::DocumentComplete {
+            status: "already_saved".into(),
+            media_kind: None,
+        }
+    );
+    assert_eq!(counts.other, 1);
+    assert_eq!(counts.reused_pdf, 0);
+
+    let label = format!("\n\r\x1b\u{202e}\u{2066}{}", "x".repeat(500));
+    reporter.event(Event::InventoryStarted {
+        label: label.clone(),
+    });
+    assert_eq!(
+        retrieval(capture.try_update().unwrap()).1,
+        Event::InventoryStarted {
+            label: "x".repeat(120),
+        }
+    );
+    assert!(publish_update(
+        Telemetry::DestinationStarted {
+            name: label.clone(),
+            index: 1,
+            total: 2,
+            audit: true,
+        },
+        &format!("\n\x1b\u{202e}{}", "l".repeat(900)),
+    ));
+    let update = capture.try_update().unwrap();
+    assert_eq!(update.line, "l".repeat(512));
+    assert!(matches!(
+        update.telemetry,
+        Some(Telemetry::DestinationStarted { name, index: 1, total: 2, audit: true })
+            if name == "x".repeat(120)
+    ));
+    assert!(publish_update(
+        Telemetry::Diagnostic {
+            component: label,
+            status: DiagnosticStatus::Warning,
+        },
+        "Doctor: review configuration",
+    ));
+    assert!(matches!(
+        capture.try_update().unwrap().telemetry,
+        Some(Telemetry::Diagnostic { component, status: DiagnosticStatus::Warning })
+            if component == "x".repeat(120)
+    ));
+}
+
+#[test]
+fn overflow_keeps_current_batch_destination_and_latest_authoritative_counts() {
+    let _guard = CAPTURE_TEST.lock().unwrap();
+    let capture = subscribe().unwrap();
+    for _ in 0..512 {
+        assert!(publish_line("Scanning documents…"));
+    }
+    let mut reporter = Reporter::new(true);
+    reporter.event(Event::InventoryStarted {
+        label: "old batch".into(),
+    });
+    reporter.event(Event::InventoryComplete {
+        documents: 400,
+        complete: true,
+    });
+    reporter.event(Event::DocumentStarted {
+        index: 1,
+        total: 400,
+    });
+    for _ in 0..400 {
+        reporter.event(Event::DocumentComplete {
+            status: "saved_pdf".into(),
+            media_kind: Some("pdf".into()),
+        });
+    }
+    reporter.event(Event::InventoryStarted {
+        label: "current batch".into(),
+    });
+    reporter.event(Event::InventoryComplete {
+        documents: 7,
+        complete: false,
+    });
+    for index in 1..=7 {
+        reporter.event(Event::DocumentStarted { index, total: 7 });
+        reporter.event(Event::DocumentComplete {
+            status: "already_saved".into(),
+            media_kind: Some("pdf".into()),
+        });
+    }
+    assert!(publish_update(
+        Telemetry::DestinationStarted {
+            name: "first destination".into(),
+            index: 1,
+            total: 2,
+            audit: false,
+        },
+        "Starting first destination",
+    ));
+    assert!(publish_update(
+        Telemetry::Delivery(DeliveryEvent {
+            phase: DeliveryPhase::Finished,
+            processed: 407,
+            total: 407,
+            delivered: 407,
+            attention: 0,
+        }),
+        "First destination finished",
+    ));
+    assert!(publish_update(
+        Telemetry::DestinationStarted {
+            name: "current destination".into(),
+            index: 2,
+            total: 2,
+            audit: true,
+        },
+        "Starting current destination",
+    ));
+    for processed in 1..=301 {
+        assert!(publish_update(
+            Telemetry::Delivery(DeliveryEvent {
+                phase: DeliveryPhase::Verifying,
+                processed,
+                total: 407,
+                delivered: processed - 1,
+                attention: 1,
+            }),
+            "Verifying current destination",
+        ));
+    }
+    assert!(publish_update(
+        Telemetry::Diagnostic {
+            component: "local store".into(),
+            status: DiagnosticStatus::Ok,
+        },
+        "Doctor: local store checked",
+    ));
+    let mut updates = Vec::new();
+    while let Some(update) = capture.try_update() {
+        updates.push(update);
+    }
+    assert_eq!(updates.len(), 256 + 7);
+    assert!(
+        updates[..256]
+            .iter()
+            .all(|update| update.telemetry.is_none())
+    );
+    let typed = updates.into_iter().skip(256).collect::<Vec<_>>();
+    let (_, event, counts) = retrieval(typed[0].clone());
+    assert_eq!(
+        event,
+        Event::InventoryStarted {
+            label: "current batch".into()
+        }
+    );
+    assert_eq!(counts.new_pdf, 400, "batch base remains available");
+    let (_, event, counts) = retrieval(typed[1].clone());
+    assert_eq!(
+        event,
+        Event::InventoryComplete {
+            documents: 7,
+            complete: false,
+        }
+    );
+    assert_eq!(counts.new_pdf, 400, "inventory certainty remains available");
+    let (_, event, counts) = retrieval(typed[2].clone());
+    assert_eq!(event, Event::DocumentStarted { index: 7, total: 7 });
+    assert_eq!(counts.reused_pdf, 6);
+    let (_, event, counts) = retrieval(typed[3].clone());
+    assert!(matches!(event, Event::DocumentComplete { .. }));
+    assert_eq!(counts.new_pdf, 400);
+    assert_eq!(counts.reused_pdf, 7);
+    assert!(matches!(
+        &typed[4].telemetry,
+        Some(Telemetry::DestinationStarted { name, index: 2, total: 2, audit: true })
+            if name == "current destination"
+    ));
+    assert!(matches!(
+        typed[5].telemetry,
+        Some(Telemetry::Delivery(DeliveryEvent {
+            phase: DeliveryPhase::Verifying,
+            processed: 301,
+            delivered: 300,
+            attention: 1,
+            ..
+        }))
+    ));
+    assert!(matches!(
+        &typed[6].telemetry,
+        Some(Telemetry::Diagnostic { component, status: DiagnosticStatus::Ok })
+            if component == "local store"
+    ));
+    assert!(
+        capture.try_update().is_none(),
+        "snapshots are never replayed"
+    );
+}
+
+#[test]
+fn publications_cannot_jump_ahead_of_a_partially_drained_overflow_suffix() {
+    let _guard = CAPTURE_TEST.lock().unwrap();
+    let capture = subscribe().unwrap();
+    for _ in 0..256 {
+        assert!(publish_line("Queued progress"));
+    }
+    assert!(publish_update(
+        Telemetry::DestinationStarted {
+            name: "destination".into(),
+            index: 1,
+            total: 1,
+            audit: false,
+        },
+        "Starting destination",
+    ));
+    assert!(publish_update(
+        Telemetry::Delivery(DeliveryEvent {
+            phase: DeliveryPhase::Waiting,
+            processed: 1,
+            total: 2,
+            delivered: 1,
+            attention: 0,
+        }),
+        "Waiting for destination",
+    ));
+    for _ in 0..256 {
+        assert!(capture.try_update().unwrap().telemetry.is_none());
+    }
+    assert!(matches!(
+        capture.try_update().unwrap().telemetry,
+        Some(Telemetry::DestinationStarted { .. })
+    ));
+    assert!(publish_update(
+        Telemetry::Diagnostic {
+            component: "configuration".into(),
+            status: DiagnosticStatus::Ok,
+        },
+        "Configuration checked",
+    ));
+    assert!(matches!(
+        capture.try_update().unwrap().telemetry,
+        Some(Telemetry::Delivery(_))
+    ));
+    assert!(matches!(
+        capture.try_update().unwrap().telemetry,
+        Some(Telemetry::Diagnostic { .. })
+    ));
+    assert!(capture.try_update().is_none());
+}
+
+#[test]
+fn overflow_does_not_apply_previous_delivery_to_a_new_destination() {
+    let _guard = CAPTURE_TEST.lock().unwrap();
+    let capture = subscribe().unwrap();
+    for _ in 0..256 {
+        assert!(publish_line("Queued progress"));
+    }
+    for index in 1..=3 {
+        assert!(publish_update(
+            Telemetry::DestinationStarted {
+                name: format!("destination {index}"),
+                index,
+                total: 3,
+                audit: false,
+            },
+            "Starting destination",
+        ));
+        if index < 3 {
+            assert!(publish_update(
+                Telemetry::Delivery(DeliveryEvent {
+                    phase: DeliveryPhase::Finished,
+                    processed: index,
+                    total: index,
+                    delivered: index,
+                    attention: 0,
+                }),
+                "Previous destination finished",
+            ));
+        }
+    }
+    for _ in 0..256 {
+        assert!(capture.try_update().unwrap().telemetry.is_none());
+    }
+    assert!(matches!(
+        capture.try_update().unwrap().telemetry,
+        Some(Telemetry::DestinationStarted { index: 3, .. })
+    ));
+    assert!(capture.try_update().is_none());
+}
+
+#[test]
+fn new_batch_purges_overflow_document_position_and_drop_restores_plain_output() {
+    let _guard = CAPTURE_TEST.lock().unwrap();
+    assert!(!publish_line("Plain output available"));
+    let capture = subscribe().unwrap();
+    assert!(subscribe().is_none());
+    for _ in 0..256 {
+        assert!(publish_line("Queued progress"));
+    }
+    let mut reporter = Reporter::new(true);
+    reporter.event(Event::InventoryStarted {
+        label: "previous".into(),
+    });
+    reporter.event(Event::InventoryComplete {
+        documents: 100,
+        complete: false,
+    });
+    reporter.event(Event::DocumentStarted {
+        index: 99,
+        total: 100,
+    });
+    reporter.event(Event::DocumentComplete {
+        status: "saved_pdf".into(),
+        media_kind: Some("pdf".into()),
+    });
+    reporter.event(Event::InventoryStarted {
+        label: "next".into(),
+    });
+    for _ in 0..256 {
+        assert_eq!(capture.try_recv().as_deref(), Some("Queued progress"));
+    }
+    let (_, event, counts) = retrieval(capture.try_update().unwrap());
+    assert_eq!(
+        event,
+        Event::InventoryStarted {
+            label: "next".into()
+        }
+    );
+    assert_eq!(counts.new_pdf, 1);
+    assert!(capture.try_update().is_none());
+    drop(capture);
+    assert!(!publish_update(
+        Telemetry::Diagnostic {
+            component: "configuration".into(),
+            status: DiagnosticStatus::NotChecked,
+        },
+        "Plain output restored",
+    ));
+    let fresh = subscribe().unwrap();
+    assert!(fresh.try_update().is_none());
+    assert!(publish_line("Fresh stream"));
+    assert_eq!(fresh.try_recv().as_deref(), Some("Fresh stream"));
+}
 
 #[test]
 fn progress_shows_work_before_an_unknown_total_is_available() {

@@ -45,6 +45,20 @@ impl Report {
         destination: Option<&str>,
         details: Option<Value>,
     ) {
+        progress::publish_update(
+            progress::Telemetry::Diagnostic {
+                component: destination
+                    .map(|name| format!("{name}/{component}"))
+                    .unwrap_or_else(|| component.into()),
+                status: match status {
+                    "ok" => progress::DiagnosticStatus::Ok,
+                    "warning" => progress::DiagnosticStatus::Warning,
+                    "error" => progress::DiagnosticStatus::Error,
+                    _ => progress::DiagnosticStatus::NotChecked,
+                },
+            },
+            &format!("Doctor: {component} — {message}"),
+        );
         let mut row = json!({"component": component, "status": status, "message": message});
         if let Some(name) = destination {
             row["destination"] = json!(name);

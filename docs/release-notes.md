@@ -6,6 +6,12 @@ Enter returns to the menu, `r` retries, `g` runs Doctor, `d` toggles details,
 and `q`/Esc quits. Standalone commands keep compact text; `--details` expands
 technical diagnostics and `--json` retains structured reports.
 
+Live progress now uses a workflow stepper, separate source/destination counters,
+current-batch progress bars and a short activity feed. Scanning stays
+indeterminate until an inventory total is known. `d` reveals the bounded detailed
+log; cached work finishes without artificial animation delays. Typed snapshots
+keep counts and destination scope current even when many updates arrive quickly.
+
 Paperless duplicate failures are recognized separately from uncertain uploads.
 A referenced existing original is adopted only after byte-count and SHA-256
 verification. Its tags, type and reviewed state are preserved. Failed tasks

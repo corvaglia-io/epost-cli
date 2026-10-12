@@ -22,17 +22,18 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use epost_cli::{
+    delivery::{DeliveryEvent, DeliveryPhase},
     error::{Error, Result},
-    progress,
+    progress::{self, DiagnosticStatus, RetrievalCounts, Telemetry},
     secret::Secret,
 };
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap},
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -154,6 +155,7 @@ impl Drop for StopGuard {
 /// neither keyboard input nor a display failure drops an upload future.
 pub(crate) async fn operation<T>(
     title: &str,
+    kind: OperationKind,
     future: impl Future<Output = Result<T>>,
 ) -> Result<T> {
     let _stop = StopGuard::new();
@@ -170,6 +172,7 @@ pub(crate) async fn operation<T>(
     let mut future = std::pin::pin!(future);
     let outcome = operation_loop(
         title,
+        kind,
         future.as_mut(),
         Some(&capture),
         |state| terminal.draw(|frame| state.render(frame)),
@@ -197,12 +200,13 @@ enum LiveOutcome<T> {
 
 async fn operation_loop<T>(
     title: &str,
+    kind: OperationKind,
     mut future: Pin<&mut impl Future<Output = Result<T>>>,
     capture: Option<&progress::Subscription>,
     mut draw: impl FnMut(&Activity) -> io::Result<()>,
     mut events: impl FnMut() -> io::Result<Vec<Event>>,
 ) -> LiveOutcome<T> {
-    let mut state = Activity::new(title);
+    let mut state = Activity::new(title, kind);
     if draw(&state).is_err() {
         return LiveOutcome::DisplayUnavailable;
     }
@@ -213,19 +217,17 @@ async fn operation_loop<T>(
             result = &mut future => return LiveOutcome::Completed(result),
             _ = tick.tick() => {
                 if let Some(capture) = capture {
-                    while let Some(line) = capture.try_recv() { state.line(&line); }
+                    for _ in 0..512 {
+                        let Some(update) = capture.try_update() else { break; };
+                        state.update(update);
+                    }
                 }
                 let Ok(events) = events() else { return LiveOutcome::DisplayUnavailable; };
                 for event in events {
                     if let Event::Key(key) = event {
                         if stop_key(key) { return LiveOutcome::StopRequested; }
                         if !pressed(key) { continue; }
-                        match key.code {
-                            KeyCode::Up | KeyCode::PageUp => state.scroll = state.scroll.saturating_add(1),
-                            KeyCode::Down | KeyCode::PageDown => state.scroll = state.scroll.saturating_sub(1),
-                            KeyCode::End => state.scroll = 0,
-                            _ => {},
-                        }
+                        state.key(key);
                     }
                 }
                 state.spinner = (state.spinner + 1) % 10;
@@ -286,31 +288,141 @@ fn heading(title: &str, subtitle: &str) -> Paragraph<'static> {
     ])
 }
 
+/// The command supplies its actual workflow; display text is never parsed to
+/// infer phases, totals or successful work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OperationKind {
+    RetrieveAndDeliver,
+    Retrieve,
+    Deliver,
+    Verify,
+    Doctor,
+    Inspect,
+    Reconcile,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Connect,
+    Inventory,
+    Retrieve,
+    Deliver,
+    Verify,
+    Diagnose,
+    Inspect,
+    Reconcile,
+}
+
+impl Phase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Connect => "Connect",
+            Self::Inventory => "Inventory",
+            Self::Retrieve => "Retrieve",
+            Self::Deliver => "Deliver",
+            Self::Verify => "Verify",
+            Self::Diagnose => "Checks",
+            Self::Inspect => "Inspect",
+            Self::Reconcile => "Reconcile",
+        }
+    }
+}
+
+impl OperationKind {
+    fn phases(self) -> &'static [Phase] {
+        match self {
+            Self::RetrieveAndDeliver => &[
+                Phase::Connect,
+                Phase::Inventory,
+                Phase::Retrieve,
+                Phase::Deliver,
+            ],
+            Self::Retrieve => &[Phase::Connect, Phase::Inventory, Phase::Retrieve],
+            Self::Deliver => &[Phase::Deliver],
+            Self::Verify => &[Phase::Verify],
+            Self::Doctor => &[Phase::Diagnose],
+            Self::Inspect => &[Phase::Inspect],
+            Self::Reconcile => &[Phase::Reconcile],
+        }
+    }
+
+    fn has_source(self) -> bool {
+        matches!(self, Self::RetrieveAndDeliver | Self::Retrieve)
+    }
+
+    fn has_destination(self) -> bool {
+        matches!(
+            self,
+            Self::RetrieveAndDeliver | Self::Deliver | Self::Verify
+        )
+    }
+}
+
+#[derive(Default)]
+struct InventoryProgress {
+    label: String,
+    batch: usize,
+    page: u32,
+    found: usize,
+    total: Option<usize>,
+    complete: Option<bool>,
+    baseline: usize,
+    processed: usize,
+    current: Option<usize>,
+}
+
+struct DestinationProgress {
+    name: String,
+    index: usize,
+    total_destinations: usize,
+    audit: bool,
+    event: Option<DeliveryEvent>,
+}
+
 struct Activity {
     title: String,
+    kind: OperationKind,
+    phase: Phase,
     history: VecDeque<String>,
-    current: String,
     spinner: usize,
     scroll: usize,
+    show_details: bool,
+    source: RetrievalCounts,
+    source_seen: bool,
+    connection_observed: bool,
+    source_exit: Option<u8>,
+    inventory: InventoryProgress,
+    destination: Option<DestinationProgress>,
+    diagnostics: Vec<(String, DiagnosticStatus)>,
+    diagnostic_overflow: bool,
 }
 
 impl Activity {
-    fn new(title: &str) -> Self {
+    fn new(title: &str, kind: OperationKind) -> Self {
         Self {
-            title: display(title, 120),
+            title: result_text(title, 120),
+            kind,
+            phase: kind.phases()[0],
             history: VecDeque::new(),
-            current: "Starting…".into(),
             spinner: 0,
             scroll: 0,
+            show_details: false,
+            source: RetrievalCounts::default(),
+            source_seen: false,
+            connection_observed: false,
+            source_exit: None,
+            inventory: InventoryProgress::default(),
+            destination: None,
+            diagnostics: Vec::new(),
+            diagnostic_overflow: false,
         }
     }
 
     fn line(&mut self, text: &str) {
-        let text = display(text, 512);
+        let text = result_text(text, 512);
         if text.is_empty() {
             return;
         }
-        self.current.clone_from(&text);
         if self.history.len() == HISTORY_LIMIT {
             self.history.pop_front();
         }
@@ -318,67 +430,803 @@ impl Activity {
         self.scroll = self.scroll.min(self.history.len().saturating_sub(1));
     }
 
-    fn render(&self, frame: &mut Frame) {
-        let areas = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(1),
+    fn update(&mut self, update: progress::Update) {
+        self.line(&update.line);
+        let Some(telemetry) = update.telemetry else {
+            return;
+        };
+        match telemetry {
+            Telemetry::Retrieval { event, counts } => {
+                // The reporter supplies a disjoint authoritative snapshot.
+                // Subtract the inventory landmark rather than counting lines
+                // or treating a DocumentStarted index as completed work.
+                let total_processed = source_processed(&counts);
+                if total_processed < source_processed(&self.source) {
+                    self.inventory.baseline = 0;
+                }
+                self.source = counts;
+                self.source_seen = true;
+                match event {
+                    progress::Event::Authenticating => {
+                        self.phase = Phase::Connect;
+                        self.connection_observed = false;
+                        self.source_exit = None;
+                    }
+                    progress::Event::ArchiveFolders => self.phase = Phase::Inventory,
+                    progress::Event::InventoryStarted { label } => {
+                        self.connection_observed = true;
+                        self.phase = Phase::Inventory;
+                        self.source_exit = None;
+                        self.inventory = InventoryProgress {
+                            label: result_text(&label, 80),
+                            batch: self.inventory.batch.saturating_add(1),
+                            baseline: total_processed,
+                            ..Default::default()
+                        };
+                    }
+                    progress::Event::Page { page, documents } => {
+                        self.connection_observed = true;
+                        self.phase = Phase::Inventory;
+                        self.inventory.page = page;
+                        self.inventory.found = documents;
+                    }
+                    progress::Event::InventoryComplete {
+                        documents,
+                        complete,
+                    } => {
+                        self.connection_observed = true;
+                        self.phase = Phase::Retrieve;
+                        self.inventory.total = Some(documents);
+                        self.inventory.found = documents;
+                        self.inventory.complete = Some(complete);
+                    }
+                    progress::Event::DocumentStarted { index, total } => {
+                        self.connection_observed = true;
+                        self.phase = Phase::Retrieve;
+                        self.inventory.current = Some(index);
+                        self.inventory.total = Some(total);
+                    }
+                    progress::Event::DocumentComplete { .. } => {
+                        self.phase = Phase::Retrieve;
+                        self.inventory.current = None;
+                    }
+                    progress::Event::Finished { exit_code } => {
+                        self.source_exit = Some(exit_code);
+                        // The source result is not the whole workflow result.
+                        // Delivery begins only when its typed update arrives.
+                    }
+                }
+                self.inventory.processed = total_processed
+                    .saturating_sub(self.inventory.baseline)
+                    .min(self.inventory.total.unwrap_or(usize::MAX));
+                if self.kind == OperationKind::Inspect {
+                    self.phase = Phase::Inspect;
+                }
+            }
+            Telemetry::DestinationStarted {
+                name,
+                index,
+                total,
+                audit,
+            } => {
+                self.phase = if self.kind == OperationKind::Verify {
+                    Phase::Verify
+                } else if self.kind == OperationKind::Reconcile {
+                    Phase::Reconcile
+                } else {
+                    Phase::Deliver
+                };
+                // Per-destination counters must never carry across targets.
+                self.destination = Some(DestinationProgress {
+                    name: result_text(&name, 80),
+                    index,
+                    total_destinations: total,
+                    audit,
+                    event: None,
+                });
+            }
+            Telemetry::Delivery(event) => {
+                self.phase = if self.kind == OperationKind::Verify {
+                    Phase::Verify
+                } else if self.kind == OperationKind::Reconcile {
+                    Phase::Reconcile
+                } else {
+                    Phase::Deliver
+                };
+                let target = self.destination.get_or_insert_with(|| DestinationProgress {
+                    name: "Destination".into(),
+                    index: 0,
+                    total_destinations: 0,
+                    audit: self.kind == OperationKind::Verify,
+                    event: None,
+                });
+                target.event = Some(event);
+            }
+            Telemetry::Diagnostic { component, status } => {
+                self.phase = Phase::Diagnose;
+                let component = result_text(&component, 120);
+                if let Some((_, previous)) = self
+                    .diagnostics
+                    .iter_mut()
+                    .find(|(name, _)| *name == component)
+                {
+                    *previous = status;
+                } else if self.diagnostics.len() < 128 {
+                    self.diagnostics.push((component, status));
+                } else {
+                    self.diagnostic_overflow = true;
+                }
+            }
+        }
+    }
+
+    fn key(&mut self, key: KeyEvent) {
+        if !pressed(key) || !key.modifiers.is_empty() {
+            return;
+        }
+        match key.code {
+            KeyCode::Char('d') => {
+                self.show_details = !self.show_details;
+                self.scroll = 0;
+            }
+            KeyCode::Up | KeyCode::PageUp if self.show_details => {
+                self.scroll = self
+                    .scroll
+                    .saturating_add(1)
+                    .min(self.history.len().saturating_sub(1));
+            }
+            KeyCode::Down | KeyCode::PageDown if self.show_details => {
+                self.scroll = self.scroll.saturating_sub(1)
+            }
+            KeyCode::End if self.show_details => self.scroll = 0,
+            _ => {}
+        }
+    }
+
+    fn phase_line(&self, short: bool) -> Line<'static> {
+        let mut spans = Vec::new();
+        for (index, phase) in self.kind.phases().iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled("  ›  ", Style::default().fg(Color::DarkGray)));
+            }
+            let (marker, color) = if *phase == Phase::Connect
+                && !self.connection_observed
+                && self.source_exit.is_some_and(|code| code != 0)
+            {
+                ("!", Color::Yellow)
+            } else if *phase == self.phase {
+                ("●", ACCENT)
+            } else if self.phase_done(*phase) {
+                ("✓", Color::Green)
+            } else if self.source_exit.is_some_and(|code| code != 0)
+                && matches!(phase, Phase::Inventory | Phase::Retrieve)
+            {
+                ("!", Color::Yellow)
+            } else {
+                ("○", Color::DarkGray)
+            };
+            let label = if short {
+                &phase.label()[..1]
+            } else {
+                phase.label()
+            };
+            spans.push(Span::styled(
+                format!("{marker} {label}"),
+                Style::default().fg(color),
+            ));
+        }
+        Line::from(spans)
+    }
+
+    fn phase_done(&self, phase: Phase) -> bool {
+        match phase {
+            Phase::Connect => self.kind.has_source() && self.connection_observed,
+            Phase::Inventory => {
+                self.source_exit == Some(0)
+                    || self.phase == Phase::Retrieve && self.inventory.complete == Some(true)
+            }
+            Phase::Retrieve => self.source_exit == Some(0),
+            _ => false,
+        }
+    }
+
+    fn spinner(&self) -> char {
+        ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'][self.spinner % 10]
+    }
+
+    fn focus(&self) -> (String, String, String, Option<(usize, usize)>, bool) {
+        if let Some(destination) = &self.destination {
+            let name = if destination.name.is_empty() {
+                "Destination"
+            } else {
+                &destination.name
+            };
+            let scope = if destination.total_destinations > 0 {
+                format!(
+                    "{name} · destination {} of {}",
+                    destination.index, destination.total_destinations
+                )
+            } else {
+                name.to_owned()
+            };
+            let Some(event) = destination.event else {
+                return if self.kind == OperationKind::Reconcile {
+                    (
+                        scope,
+                        "Verifying selected existing original…".into(),
+                        "Waiting for the verification result".into(),
+                        None,
+                        false,
+                    )
+                } else {
+                    (
+                        scope,
+                        "Preparing destination…".into(),
+                        "Local document total is not known yet".into(),
+                        None,
+                        false,
+                    )
+                };
+            };
+            let action = match event.phase {
+                DeliveryPhase::Started => "Preparing local documents",
+                DeliveryPhase::Uploading => "Uploading",
+                DeliveryPhase::Waiting => "Waiting for processing",
+                DeliveryPhase::Verifying => "Verifying destination content",
+                DeliveryPhase::Reconciling => "Reconciling previous upload",
+                DeliveryPhase::Finished if event.processed < event.total => {
+                    "Destination stopped before all items were processed"
+                }
+                DeliveryPhase::Finished if event.attention > 0 => {
+                    "Destination finished with items requiring attention"
+                }
+                DeliveryPhase::Finished => "Destination items processed",
+            };
+            let note = if destination.audit {
+                "Verification of this destination's local documents"
+            } else {
+                "Progress for this destination's local documents"
+            };
+            return (
+                scope,
+                action.into(),
+                note.into(),
+                Some((event.processed, event.total)),
+                event.attention > 0
+                    || event.phase == DeliveryPhase::Finished && event.processed < event.total,
+            );
+        }
+        match self.phase {
+            Phase::Connect if self.source_exit.is_some_and(|code| code != 0) => (
+                "Source connection".into(),
+                if self.source_exit == Some(3) {
+                    "Source connection failed · existing local results preserved"
+                } else {
+                    "Source operation stopped before inventory · local results preserved"
+                }
+                .into(),
+                "No completed source connection was observed".into(),
+                None,
+                true,
+            ),
+            Phase::Inspect if self.inventory.batch > 0 => {
+                let label = if self.inventory.label.is_empty() {
+                    "Selected metadata"
+                } else {
+                    &self.inventory.label
+                };
+                let message = if self.inventory.total.is_some() {
+                    format!("{} documents observed", self.inventory.found)
+                } else if self.inventory.page > 0 {
+                    format!(
+                        "Reading page {} · {} documents observed",
+                        self.inventory.page, self.inventory.found
+                    )
+                } else {
+                    "Reading selected metadata…".into()
+                };
+                (
+                    label.into(),
+                    message,
+                    "Metadata listing · mailbox total is not provided".into(),
+                    None,
+                    self.inventory.complete == Some(false),
+                )
+            }
+            Phase::Inventory => {
+                let label = if self.inventory.label.is_empty() {
+                    "Selected source"
+                } else {
+                    &self.inventory.label
+                };
+                let scope = if self.inventory.batch > 0 {
+                    format!("{label} · inventory {}", self.inventory.batch)
+                } else {
+                    label.into()
+                };
+                let message = if self.inventory.page > 0 {
+                    format!(
+                        "Scanning page {} · {} documents found so far",
+                        self.inventory.page, self.inventory.found
+                    )
+                } else {
+                    "Scanning documents…".into()
+                };
+                (
+                    scope,
+                    message,
+                    "Total unknown until this inventory finishes".into(),
+                    None,
+                    false,
+                )
+            }
+            Phase::Retrieve => {
+                let label = if self.inventory.label.is_empty() {
+                    "Selected source"
+                } else {
+                    &self.inventory.label
+                };
+                let scope = format!("{label} · inventory {}", self.inventory.batch.max(1));
+                let message = match (self.source_exit, self.inventory.current) {
+                    (Some(0), _) if self.kind == OperationKind::RetrieveAndDeliver => {
+                        "Source retrieval finished · preparing delivery".into()
+                    }
+                    (Some(0), _) => "Source retrieval finished".into(),
+                    (Some(_), _) => {
+                        "Source retrieval needs attention · completed results preserved".into()
+                    }
+                    (None, Some(index)) => format!("Checking item {index}"),
+                    _ => "Retrieving observed documents…".into(),
+                };
+                let note = if self.inventory.complete == Some(false) {
+                    "Incomplete inventory · progress covers only observed documents"
+                } else {
+                    "Progress for this inventory · mailbox total is not provided"
+                };
+                (
+                    scope,
+                    message,
+                    note.into(),
+                    self.inventory
+                        .total
+                        .map(|total| (self.inventory.processed, total)),
+                    self.inventory.complete == Some(false)
+                        || self.source_exit.is_some_and(|code| code != 0),
+                )
+            }
+            Phase::Diagnose => {
+                let message = self
+                    .diagnostics
+                    .last()
+                    .map(|(component, _)| format!("Checking {component}"))
+                    .unwrap_or_else(|| "Checking local configuration and access…".into());
+                (
+                    "Doctor".into(),
+                    message,
+                    "Checks report observed results; total checks is not provided".into(),
+                    None,
+                    self.diagnostic_overflow
+                        || self.diagnostics.iter().any(|(_, status)| {
+                            matches!(status, DiagnosticStatus::Warning | DiagnosticStatus::Error)
+                        }),
+                )
+            }
+            phase => (
+                phase.label().into(),
+                match phase {
+                    Phase::Connect => "Connecting to the selected source…",
+                    Phase::Deliver => "Preparing delivery…",
+                    Phase::Verify => "Preparing destination verification…",
+                    Phase::Inspect => "Inspecting selected local state…",
+                    Phase::Reconcile => "Verifying the selected existing original…",
+                    _ => "Starting…",
+                }
+                .into(),
+                "Waiting for observed progress".into(),
+                None,
+                false,
+            ),
+        }
+    }
+
+    fn source_lines(&self) -> Vec<Line<'static>> {
+        if !self.source_seen {
+            return vec![Line::styled(
+                "Waiting for retrieval results",
+                Style::default().fg(Color::DarkGray),
+            )];
+        }
+        let counts = &self.source;
+        vec![
+            metric_pair(
+                "New PDF",
+                counts.new_pdf,
+                "Reused PDF",
+                counts.reused_pdf,
+                Color::Green,
+            ),
+            metric_pair(
+                "Other formats",
+                counts.other,
+                "Pending",
+                counts.pending,
+                Color::Yellow,
+            ),
+            metric_pair(
+                "Failed",
+                counts.failed,
+                "Deferred",
+                counts.deferred,
+                Color::Yellow,
+            ),
+        ]
+    }
+
+    fn destination_lines(&self) -> Vec<Line<'static>> {
+        let Some(destination) = &self.destination else {
+            return vec![Line::styled(
+                "Waiting for destination",
+                Style::default().fg(Color::DarkGray),
+            )];
+        };
+        let Some(event) = destination.event else {
+            return vec![
+                Line::from(destination.name.clone()),
+                Line::styled(
+                    "Waiting for local inventory",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ];
+        };
+        vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("{}", event.delivered),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" confirmed"),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    format!("{}", event.attention),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" need attention"),
+            ]),
+            Line::styled(
+                format!("{} / {} processed", event.processed, event.total),
+                Style::default().fg(Color::Gray),
+            ),
+        ]
+    }
+
+    fn render_focus(&self, frame: &mut Frame, area: Rect, bordered: bool) {
+        let (scope, message, note, gauge, attention) = self.focus();
+        let color = if attention { Color::Yellow } else { ACCENT };
+        let block = if bordered {
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {scope} "))
+                .border_style(Style::default().fg(color))
+        } else {
+            Block::default()
+        };
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let rows = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(1),
         ])
-        .split(frame.area());
-        frame.render_widget(heading("ePost", &self.title), areas[0]);
-        let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'][self.spinner];
+        .split(inner);
         frame.render_widget(
-            Paragraph::new(format!("{spinner} {}", self.current))
-                .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Current phase ")
-                        .border_style(Style::default().fg(ACCENT)),
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{} ", self.spinner()), Style::default().fg(color)),
+                Span::styled(
+                    message,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
                 ),
-            areas[1],
+            ])),
+            rows[0],
         );
-        let visible = usize::from(areas[2].height.saturating_sub(2));
-        let end = self
-            .history
-            .len()
-            .saturating_sub(self.scroll.min(self.history.len()));
+        if let Some((processed, total)) = gauge {
+            // This is strictly the current observed inventory/destination, not
+            // a mailbox percentage. A result never synthesizes completion.
+            if total == 0 {
+                frame.render_widget(
+                    Paragraph::new("0 / 0 processed · no documents in this inventory")
+                        .style(Style::default().fg(Color::Gray)),
+                    rows[1],
+                );
+            } else {
+                frame.render_widget(
+                    Gauge::default()
+                        .ratio((processed.min(total) as f64 / total as f64).clamp(0.0, 1.0))
+                        .label(format!("{processed} / {total} processed"))
+                        .gauge_style(Style::default().fg(color).bg(Color::DarkGray)),
+                    rows[1],
+                );
+            }
+        } else {
+            frame.render_widget(
+                Paragraph::new("Working · total unknown").style(Style::default().fg(Color::Gray)),
+                rows[1],
+            );
+        }
+        frame.render_widget(
+            Paragraph::new(note).style(Style::default().fg(if attention {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            })),
+            rows[2],
+        );
+    }
+
+    fn render_counters(&self, frame: &mut Frame, area: Rect) {
+        let areas = if self.kind.has_source() && self.kind.has_destination() {
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area)
+        } else {
+            Layout::horizontal([Constraint::Percentage(100)]).split(area)
+        };
+        let panel = |title: &'static str, lines: Vec<Line<'static>>| {
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+        };
+        if self.kind.has_source() {
+            frame.render_widget(panel(" Source results ", self.source_lines()), areas[0]);
+        }
+        if self.kind.has_destination() {
+            frame.render_widget(
+                panel(" Destination results ", self.destination_lines()),
+                areas[areas.len() - 1],
+            );
+        }
+        if self.kind == OperationKind::Doctor {
+            frame.render_widget(
+                panel(" Diagnostic results ", self.diagnostic_lines()),
+                areas[0],
+            );
+        }
+    }
+
+    fn diagnostic_lines(&self) -> Vec<Line<'static>> {
+        let count = |expected| {
+            self.diagnostics
+                .iter()
+                .filter(|(_, status)| *status == expected)
+                .count()
+        };
+        vec![
+            metric_pair(
+                "OK",
+                count(DiagnosticStatus::Ok),
+                "Warning",
+                count(DiagnosticStatus::Warning),
+                Color::Green,
+            ),
+            metric_pair(
+                "Error",
+                count(DiagnosticStatus::Error),
+                "Not checked",
+                count(DiagnosticStatus::NotChecked),
+                Color::Yellow,
+            ),
+            Line::styled(
+                if self.diagnostic_overflow {
+                    "Counts limited to 128 observed checks · see the Doctor report"
+                } else {
+                    "Observed checks · no completion percentage"
+                },
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]
+    }
+
+    fn render_history(&self, frame: &mut Frame, area: Rect, bordered: bool) {
+        let block = if bordered {
+            Block::default()
+                .borders(Borders::ALL)
+                .title(if self.show_details {
+                    " Details · recent 100 events "
+                } else {
+                    " Recent activity "
+                })
+                .border_style(Style::default().fg(Color::DarkGray))
+        } else {
+            Block::default()
+        };
+        let inner = block.inner(area);
+        let visible =
+            usize::from(inner.height).min(if self.show_details { HISTORY_LIMIT } else { 3 });
+        let end = self.history.len().saturating_sub(if self.show_details {
+            self.scroll.min(self.history.len())
+        } else {
+            0
+        });
         let start = end.saturating_sub(visible);
-        let lines: Vec<Line<'_>> = self
+        let mut lines: Vec<_> = self
             .history
             .iter()
             .skip(start)
             .take(end - start)
-            .map(|line| {
-                let attention = line.contains("failed")
-                    || line.contains("incomplete")
-                    || line.contains("attention")
-                    || line.contains("Requires acceptance");
-                Line::styled(
-                    line.as_str(),
-                    Style::default().fg(if attention {
-                        Color::Yellow
-                    } else {
-                        Color::Gray
-                    }),
-                )
-            })
+            .map(|line| Line::styled(line.as_str(), Style::default().fg(Color::Gray)))
             .collect();
-        frame.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Progress · counts reflect work observed "),
-            ),
-            areas[2],
-        );
-        frame.render_widget(
-            Paragraph::new("↑/↓ scroll · q/Esc/Ctrl-C stop after current request")
-                .style(Style::default().fg(Color::DarkGray)),
-            areas[3],
-        );
+        if lines.is_empty() {
+            lines.push(Line::styled(
+                "Waiting for activity…",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        frame.render_widget(block, area);
+        frame.render_widget(Paragraph::new(lines), inner);
     }
+
+    fn render(&self, frame: &mut Frame) {
+        let area = frame.area();
+        if area.is_empty() {
+            return;
+        }
+        let compact = area.width < 56 || area.height < 18;
+        let body = if compact {
+            area
+        } else {
+            area.inner(ratatui::layout::Margin::new(1, 1))
+        };
+        if compact {
+            let rows = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(body);
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    self.title.as_str(),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )),
+                rows[0],
+            );
+            frame.render_widget(Paragraph::new(self.phase_line(area.width < 40)), rows[1]);
+            self.render_focus(frame, rows[2], false);
+            if self.show_details {
+                self.render_history(frame, rows[3], false);
+            } else {
+                let mut lines = Vec::new();
+                if self.kind.has_source() {
+                    lines.push(Line::styled("Source results", Style::default().fg(ACCENT)));
+                    lines.extend(self.source_lines());
+                }
+                if self.kind.has_destination() {
+                    lines.push(Line::styled(
+                        "Destination results",
+                        Style::default().fg(ACCENT),
+                    ));
+                    lines.extend(self.destination_lines());
+                }
+                if self.kind == OperationKind::Doctor {
+                    lines.push(Line::styled(
+                        "Diagnostic results",
+                        Style::default().fg(ACCENT),
+                    ));
+                    lines.extend(self.diagnostic_lines());
+                }
+                if !self.history.is_empty() {
+                    lines.push(Line::styled("Recent activity", Style::default().fg(ACCENT)));
+                    lines.extend(
+                        self.history
+                            .iter()
+                            .skip(self.history.len().saturating_sub(3))
+                            .map(|line| {
+                                Line::styled(line.as_str(), Style::default().fg(Color::Gray))
+                            }),
+                    );
+                }
+                frame.render_widget(Paragraph::new(lines), rows[3]);
+            }
+            frame.render_widget(
+                Paragraph::new("d details · q/Esc stop")
+                    .style(Style::default().fg(Color::DarkGray)),
+                rows[4],
+            );
+            return;
+        }
+        let rows = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .split(body);
+        frame.render_widget(heading("ePost", &self.title), rows[0]);
+        frame.render_widget(Paragraph::new(self.phase_line(false)), rows[1]);
+        if self.show_details {
+            self.render_history(frame, rows[2], true);
+        } else {
+            let has_counters = self.kind.has_source()
+                || self.kind.has_destination()
+                || self.kind == OperationKind::Doctor;
+            let panels = Layout::vertical([
+                Constraint::Length(5),
+                Constraint::Length(if has_counters { 5 } else { 0 }),
+                Constraint::Min(0),
+            ])
+            .split(rows[2]);
+            self.render_focus(frame, panels[0], true);
+            if has_counters {
+                self.render_counters(frame, panels[1]);
+            }
+            self.render_history(frame, panels[2], true);
+        }
+        let footer = vec![
+            Line::from(vec![
+                Span::styled(
+                    if self.show_details {
+                        " d  Dashboard "
+                    } else {
+                        " d  Details "
+                    },
+                    Style::default().fg(Color::Black).bg(ACCENT),
+                ),
+                Span::raw("  q/Esc/Ctrl-C Stop after current request"),
+            ]),
+            Line::styled(
+                if self.show_details {
+                    "↑/↓ scroll · End latest · history is bounded to 100 events"
+                } else {
+                    "Counts reflect observed work; each gauge covers its current inventory or destination"
+                },
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+        frame.render_widget(Paragraph::new(footer), rows[3]);
+    }
+}
+
+fn source_processed(counts: &RetrievalCounts) -> usize {
+    [
+        counts.new_pdf,
+        counts.reused_pdf,
+        counts.other,
+        counts.pending,
+        counts.failed,
+        counts.deferred,
+    ]
+    .into_iter()
+    .fold(0usize, usize::saturating_add)
+}
+
+fn metric_pair(
+    first: &str,
+    first_count: usize,
+    second: &str,
+    second_count: usize,
+    color: Color,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{first_count}"),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(" {first}    ")),
+        Span::styled(
+            format!("{second_count}"),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(" {second}")),
+    ])
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1702,31 +2550,532 @@ mod tests {
         );
     }
 
+    fn source_update(state: &mut Activity, event: progress::Event, counts: RetrievalCounts) {
+        state.update(progress::Update {
+            line: "Synthetic retrieval activity".into(),
+            telemetry: Some(Telemetry::Retrieval { event, counts }),
+        });
+    }
+
+    fn destination_start(
+        state: &mut Activity,
+        name: &str,
+        index: usize,
+        total: usize,
+        audit: bool,
+    ) {
+        state.update(progress::Update {
+            line: "Synthetic destination activity".into(),
+            telemetry: Some(Telemetry::DestinationStarted {
+                name: name.into(),
+                index,
+                total,
+                audit,
+            }),
+        });
+    }
+
+    fn destination_update(
+        state: &mut Activity,
+        phase: DeliveryPhase,
+        processed: usize,
+        total: usize,
+    ) {
+        state.update(progress::Update {
+            line: "Synthetic delivery activity".into(),
+            telemetry: Some(Telemetry::Delivery(DeliveryEvent {
+                phase,
+                processed,
+                total,
+                delivered: processed,
+                attention: 0,
+            })),
+        });
+    }
+
     #[test]
-    fn progress_is_bounded_shows_known_counts_and_keeps_uncertainty() {
-        let mut state = Activity::new("Synthetic inbox sync");
+    fn progress_inventory_keeps_unknown_total_and_never_parses_log_counts() {
+        let mut state = Activity::new("Synthetic inbox check", OperationKind::RetrieveAndDeliver);
+        state.line("Checking document 99 of 100…");
+        assert!(!state.source_seen);
+        assert!(state.inventory.total.is_none());
+        source_update(
+            &mut state,
+            progress::Event::InventoryStarted {
+                label: "inbox".into(),
+            },
+            RetrievalCounts::default(),
+        );
+        source_update(
+            &mut state,
+            progress::Event::Page {
+                page: 2,
+                documents: 7,
+            },
+            RetrievalCounts::default(),
+        );
+        let rendered = screen(90, 24, |frame| state.render(frame));
+        for text in [
+            "Connect",
+            "Inventory",
+            "Retrieve",
+            "Deliver",
+            "Scanning page 2",
+            "7 documents found so far",
+            "total unknown",
+            "Source results",
+            "Destination results",
+        ] {
+            assert!(rendered.contains(text), "missing progress text: {text}");
+        }
+        assert!(!rendered.contains('%'));
+        assert_eq!(state.focus().3, None);
+        assert_eq!(state.inventory.processed, 0);
+    }
+
+    #[test]
+    fn source_gauge_counts_completed_snapshots_and_resets_for_each_inventory() {
+        let mut state = Activity::new("Synthetic source check", OperationKind::Retrieve);
+        source_update(
+            &mut state,
+            progress::Event::InventoryStarted {
+                label: "inbox".into(),
+            },
+            RetrievalCounts::default(),
+        );
+        source_update(
+            &mut state,
+            progress::Event::InventoryComplete {
+                documents: 8,
+                complete: true,
+            },
+            RetrievalCounts::default(),
+        );
+        source_update(
+            &mut state,
+            progress::Event::DocumentStarted { index: 1, total: 8 },
+            RetrievalCounts::default(),
+        );
+        assert_eq!(state.focus().3, Some((0, 8)));
+        let counts = RetrievalCounts {
+            new_pdf: 1,
+            reused_pdf: 2,
+            other: 1,
+            pending: 1,
+            failed: 0,
+            deferred: 1,
+        };
+        source_update(
+            &mut state,
+            progress::Event::DocumentComplete {
+                status: "already_saved".into(),
+                media_kind: Some("pdf".into()),
+            },
+            counts,
+        );
+        assert_eq!(state.focus().3, Some((6, 8)));
+        // A subsequent authoritative snapshot recovers missed completions;
+        // the next attempted index still cannot count the in-flight document.
+        source_update(
+            &mut state,
+            progress::Event::DocumentStarted { index: 8, total: 8 },
+            RetrievalCounts {
+                new_pdf: 2,
+                reused_pdf: 2,
+                other: 1,
+                pending: 1,
+                failed: 0,
+                deferred: 1,
+            },
+        );
+        assert_eq!(state.focus().3, Some((7, 8)));
+        source_update(
+            &mut state,
+            progress::Event::InventoryStarted {
+                label: "archive folder".into(),
+            },
+            RetrievalCounts {
+                new_pdf: 2,
+                reused_pdf: 2,
+                other: 1,
+                pending: 1,
+                failed: 0,
+                deferred: 1,
+            },
+        );
+        assert_eq!(state.inventory.batch, 2);
+        assert_eq!(state.inventory.processed, 0);
+        assert!(state.inventory.total.is_none());
+        source_update(
+            &mut state,
+            progress::Event::InventoryComplete {
+                documents: 3,
+                complete: true,
+            },
+            RetrievalCounts {
+                new_pdf: 2,
+                reused_pdf: 2,
+                other: 1,
+                pending: 1,
+                failed: 0,
+                deferred: 1,
+            },
+        );
+        source_update(
+            &mut state,
+            progress::Event::DocumentComplete {
+                status: "saved_pdf".into(),
+                media_kind: Some("pdf".into()),
+            },
+            RetrievalCounts {
+                new_pdf: 3,
+                reused_pdf: 2,
+                other: 1,
+                pending: 1,
+                failed: 0,
+                deferred: 1,
+            },
+        );
+        assert_eq!(state.focus().3, Some((1, 3)));
+        assert_eq!(state.source.new_pdf, 3);
+        let rendered = screen(90, 24, |frame| state.render(frame));
+        assert!(rendered.contains("archive folder · inventory 2"));
+        assert!(rendered.contains("1 / 3 processed"));
+        assert!(!rendered.contains('%'));
+    }
+
+    #[test]
+    fn source_finished_is_separate_from_delivery_and_each_destination_resets_its_gauge() {
+        let mut state = Activity::new(
+            "Synthetic check and delivery",
+            OperationKind::RetrieveAndDeliver,
+        );
+        source_update(
+            &mut state,
+            progress::Event::InventoryStarted {
+                label: "inbox".into(),
+            },
+            RetrievalCounts::default(),
+        );
+        source_update(
+            &mut state,
+            progress::Event::InventoryComplete {
+                documents: 4,
+                complete: true,
+            },
+            RetrievalCounts::default(),
+        );
+        source_update(
+            &mut state,
+            progress::Event::Finished { exit_code: 0 },
+            RetrievalCounts {
+                new_pdf: 3,
+                reused_pdf: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.phase, Phase::Retrieve);
+        assert!(state.focus().1.contains("preparing delivery"));
+        assert_eq!(state.focus().3, Some((4, 4)));
+        destination_start(&mut state, "synthetic-folder", 1, 2, false);
+        assert_eq!(state.phase, Phase::Deliver);
+        assert_eq!(state.focus().3, None);
+        destination_update(&mut state, DeliveryPhase::Uploading, 1, 4);
+        assert_eq!(state.focus().3, Some((1, 4)));
+        assert_eq!(state.source.new_pdf, 3);
+        destination_update(&mut state, DeliveryPhase::Finished, 4, 4);
+        destination_start(&mut state, "synthetic-paperless", 2, 2, false);
+        assert_eq!(state.focus().3, None);
+        assert!(state.destination.as_ref().unwrap().event.is_none());
+        destination_update(&mut state, DeliveryPhase::Verifying, 0, 3);
+        assert_eq!(state.focus().3, Some((0, 3)));
+        let rendered = screen(90, 24, |frame| state.render(frame));
+        for text in [
+            "synthetic-paperless",
+            "destination 2 of 2",
+            "0 / 3 processed",
+            "Verifying destination content",
+            "3 New PDF",
+            "1 Reused PDF",
+            "0 confirmed",
+        ] {
+            assert!(rendered.contains(text), "missing destination text: {text}");
+        }
+    }
+
+    #[test]
+    fn source_authentication_failure_never_becomes_connected_during_local_delivery() {
+        let mut state = Activity::new(
+            "Synthetic source failure",
+            OperationKind::RetrieveAndDeliver,
+        );
+        source_update(
+            &mut state,
+            progress::Event::Authenticating,
+            RetrievalCounts::default(),
+        );
+        assert!(!state.phase_done(Phase::Connect));
+        source_update(
+            &mut state,
+            progress::Event::Finished { exit_code: 3 },
+            RetrievalCounts::default(),
+        );
+        assert!(!state.phase_done(Phase::Connect));
+        assert!(state.focus().1.contains("connection failed"));
+        destination_start(&mut state, "synthetic-local-destination", 1, 1, false);
+        destination_update(&mut state, DeliveryPhase::Uploading, 1, 2);
+        assert!(!state.phase_done(Phase::Connect));
+        let rendered = screen(90, 24, |frame| state.render(frame));
+        assert!(rendered.contains("! Connect"));
+        assert!(!rendered.contains("✓ Connect"));
+        source_update(
+            &mut state,
+            progress::Event::InventoryStarted {
+                label: "inbox".into(),
+            },
+            RetrievalCounts::default(),
+        );
+        assert!(state.phase_done(Phase::Connect));
+        source_update(
+            &mut state,
+            progress::Event::Authenticating,
+            RetrievalCounts::default(),
+        );
+        assert!(!state.phase_done(Phase::Connect));
+    }
+
+    #[test]
+    fn partial_and_stopped_operations_never_force_progress_to_complete() {
+        let mut state = Activity::new("Synthetic partial source", OperationKind::Retrieve);
+        source_update(
+            &mut state,
+            progress::Event::InventoryStarted {
+                label: "inbox".into(),
+            },
+            RetrievalCounts::default(),
+        );
+        source_update(
+            &mut state,
+            progress::Event::InventoryComplete {
+                documents: 5,
+                complete: false,
+            },
+            RetrievalCounts::default(),
+        );
+        source_update(
+            &mut state,
+            progress::Event::Finished { exit_code: 2 },
+            RetrievalCounts {
+                pending: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.focus().3, Some((1, 5)));
+        let rendered = screen(90, 24, |frame| state.render(frame));
+        assert!(rendered.contains("Incomplete inventory"));
+        assert!(rendered.contains("1 / 5 processed"));
+        assert!(rendered.contains("needs attention"));
+        assert!(!state.phase_done(Phase::Retrieve));
+        assert!(!rendered.contains("100%"));
+        let mut state = Activity::new("Synthetic stopped delivery", OperationKind::Deliver);
+        destination_start(&mut state, "synthetic-target", 1, 1, false);
+        destination_update(&mut state, DeliveryPhase::Finished, 1, 5);
+        assert_eq!(state.focus().3, Some((1, 5)));
+        let rendered = screen(90, 24, |frame| state.render(frame));
+        assert!(rendered.contains("stopped before all items"));
+        assert!(rendered.contains("1 / 5 processed"));
+        assert!(!rendered.contains("100%"));
+    }
+
+    #[test]
+    fn progress_phases_and_counters_match_each_command() {
+        for (kind, label) in [
+            (OperationKind::Deliver, "Deliver"),
+            (OperationKind::Verify, "Verify"),
+            (OperationKind::Doctor, "Checks"),
+            (OperationKind::Inspect, "Inspect"),
+            (OperationKind::Reconcile, "Reconcile"),
+        ] {
+            let state = Activity::new("Synthetic command", kind);
+            assert_eq!(kind.phases().len(), 1);
+            let rendered = screen(90, 24, |frame| state.render(frame));
+            assert!(rendered.contains(label));
+            assert!(!rendered.contains("Source results"));
+            assert!(!rendered.contains("Mailbox"));
+        }
+        let mut inspect = Activity::new("Synthetic metadata", OperationKind::Inspect);
+        source_update(
+            &mut inspect,
+            progress::Event::Authenticating,
+            RetrievalCounts::default(),
+        );
+        assert_eq!(inspect.phase, Phase::Inspect);
+        source_update(
+            &mut inspect,
+            progress::Event::InventoryStarted {
+                label: "synthetic metadata listing".into(),
+            },
+            RetrievalCounts::default(),
+        );
+        source_update(
+            &mut inspect,
+            progress::Event::Page {
+                page: 1,
+                documents: 4,
+            },
+            RetrievalCounts::default(),
+        );
+        source_update(
+            &mut inspect,
+            progress::Event::InventoryComplete {
+                documents: 4,
+                complete: true,
+            },
+            RetrievalCounts::default(),
+        );
+        assert_eq!(inspect.phase, Phase::Inspect);
+        let rendered = screen(90, 24, |frame| inspect.render(frame));
+        assert!(rendered.contains("4 documents observed"));
+        assert!(rendered.contains("Metadata listing"));
+        assert!(!rendered.contains("Retrieving"));
+        assert!(!rendered.contains("Source results"));
+        let mut reconcile = Activity::new("Synthetic recovery", OperationKind::Reconcile);
+        destination_start(&mut reconcile, "synthetic-target", 1, 1, true);
+        assert_eq!(reconcile.phase, Phase::Reconcile);
+        assert!(reconcile.focus().1.contains("selected existing original"));
+        let mut state = Activity::new("Synthetic verification", OperationKind::Verify);
+        destination_start(&mut state, "synthetic-target", 1, 1, true);
+        destination_update(&mut state, DeliveryPhase::Verifying, 2, 4);
+        assert_eq!(state.phase, Phase::Verify);
+        let rendered = screen(90, 24, |frame| state.render(frame));
+        assert!(rendered.contains("Verification of this destination"));
+        assert!(rendered.contains("2 / 4 processed"));
+        let mut state = Activity::new("Synthetic Doctor", OperationKind::Doctor);
+        for status in [DiagnosticStatus::Warning, DiagnosticStatus::Ok] {
+            state.update(progress::Update {
+                line: "Synthetic check".into(),
+                telemetry: Some(Telemetry::Diagnostic {
+                    component: "local configuration".into(),
+                    status,
+                }),
+            });
+        }
+        assert_eq!(state.diagnostics.len(), 1);
+        let rendered = screen(90, 24, |frame| state.render(frame));
+        assert!(rendered.contains("1 OK"));
+        assert!(rendered.contains("0 Warning"));
+        let compact = screen(48, 14, |frame| state.render(frame));
+        assert!(compact.contains("Diagnostic results"));
+        assert!(compact.contains("1 OK"));
+        assert!(compact.contains("0 Warning"));
+        assert!(compact.contains("Recent activity"));
+        assert!(compact.contains("Synthetic check"));
+    }
+
+    #[test]
+    fn progress_details_are_bounded_sanitized_and_separate_from_recent_activity() {
+        let mut state = Activity::new("Synthetic\n\x1b\u{202e} title", OperationKind::Retrieve);
         for index in 0..1000 {
-            state.line(&format!("Scanning page {index}…"));
+            state.line(&format!("Synthetic event {index}"));
         }
         assert_eq!(state.history.len(), HISTORY_LIMIT);
-        state.line("Inventory incomplete: 63 documents found so far.");
-        state.line("Checking document 1 of 63…");
-        let rendered = screen(90, 18, |frame| state.render(frame));
-        assert!(rendered.contains("1 of 63"));
-        assert!(rendered.contains("Inventory incomplete"));
-        assert!(!rendered.contains('%'));
-        state.scroll = 50;
-        let earlier = screen(90, 18, |frame| state.render(frame));
-        assert!(earlier.contains("Scanning page"));
+        assert!(!state.history.iter().any(|line| line == "Synthetic event 0"));
+        state.line(&format!("provider\n\x1b\u{202e}{}", "x".repeat(4000)));
+        assert!(state.history.back().unwrap().chars().count() <= 512);
+        assert!(state.history.back().unwrap().chars().all(visible_character));
+        state.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(state.scroll, 0);
+        state.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));
+        assert!(!state.show_details);
+        let rendered = screen(90, 24, |frame| state.render(frame));
+        assert!(!rendered.contains("Synthetic event 950"));
+        state.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(state.show_details);
+        for _ in 0..50 {
+            state.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        }
+        let rendered = screen(90, 24, |frame| state.render(frame));
+        assert!(rendered.contains("Details · recent 100 events"));
+        assert!(rendered.contains("Synthetic event 950"));
+        assert!(!rendered.contains('\u{202e}'));
+        state.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(state.scroll, 0);
+        state.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(!state.show_details);
+        source_update(
+            &mut state,
+            progress::Event::InventoryStarted {
+                label: format!("synthetic\n\x1b\u{202e}{}", "x".repeat(1000)),
+            },
+            RetrievalCounts::default(),
+        );
+        assert!(state.inventory.label.chars().count() <= 80);
+        assert!(state.inventory.label.chars().all(visible_character));
+        destination_start(
+            &mut state,
+            &format!("synthetic\n\x1b\u{202e}{}", "x".repeat(1000)),
+            1,
+            1,
+            false,
+        );
+        assert!(state.destination.as_ref().unwrap().name.chars().count() <= 80);
+        assert!(
+            state
+                .destination
+                .as_ref()
+                .unwrap()
+                .name
+                .chars()
+                .all(visible_character)
+        );
+    }
+
+    #[test]
+    fn diagnostic_counter_storage_is_bounded_and_reports_omissions() {
+        let mut state = Activity::new("Synthetic Doctor", OperationKind::Doctor);
+        for index in 0..140 {
+            state.update(progress::Update {
+                line: "Synthetic check".into(),
+                telemetry: Some(Telemetry::Diagnostic {
+                    component: format!("synthetic-component-{index}"),
+                    status: DiagnosticStatus::Ok,
+                }),
+            });
+        }
+        assert_eq!(state.diagnostics.len(), 128);
+        assert!(state.diagnostic_overflow);
+        assert!(state.focus().4);
+        let rendered = screen(100, 24, |frame| state.render(frame));
+        assert!(rendered.contains("Counts limited to 128 observed checks"));
+        assert!(!rendered.contains("140 OK"));
     }
 
     #[test]
     fn tiny_resized_screens_render_without_panicking() {
         let state = Home::new(None, &[], true);
-        let activity = Activity::new("synthetic work");
+        let mut activity = Activity::new("synthetic work", OperationKind::RetrieveAndDeliver);
+        source_update(
+            &mut activity,
+            progress::Event::InventoryStarted {
+                label: "synthetic empty inventory".into(),
+            },
+            RetrievalCounts::default(),
+        );
+        source_update(
+            &mut activity,
+            progress::Event::InventoryComplete {
+                documents: 0,
+                complete: true,
+            },
+            RetrievalCounts::default(),
+        );
+        assert_eq!(activity.focus().3, Some((0, 0)));
         let prompts = TuiPrompts::default();
-        for (width, height) in [(1, 1), (5, 2), (20, 8), (80, 24)] {
+        for (width, height) in [(0, 0), (0, 4), (4, 0), (1, 1), (5, 2), (20, 8), (80, 24)] {
             screen(width, height, |frame| state.render(frame));
+            activity.show_details = false;
+            screen(width, height, |frame| activity.render(frame));
+            activity.show_details = true;
             screen(width, height, |frame| activity.render(frame));
             screen(width, height, |frame| {
                 prompts.render_input(frame, "Password", &InputBuffer::default(), true)
@@ -1857,6 +3206,7 @@ mod tests {
             });
             let outcome = operation_loop(
                 "Synthetic upload",
+                OperationKind::Deliver,
                 future.as_mut(),
                 None,
                 |_| {
@@ -1887,6 +3237,7 @@ mod tests {
         let mut future = std::pin::pin!(async { Err::<(), _>(Error::Auth) });
         let outcome = operation_loop(
             "Synthetic sign-in",
+            OperationKind::Retrieve,
             future.as_mut(),
             None,
             |_| Ok(()),

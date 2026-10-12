@@ -112,6 +112,27 @@ pub(super) async fn run(cli: &Cli) -> Result<(Value, u8)> {
                 return Err(Error::Config("reconcile requires a Paperless destination"));
             }
             let client = destination_cli::client_for(cli, &root, &store, &destination)?;
+            if progress_enabled(cli) {
+                progress::publish_update(
+                    progress::Telemetry::DestinationStarted {
+                        name: args.destination.clone(),
+                        index: 1,
+                        total: 1,
+                        audit: true,
+                    },
+                    "Reconcile: checking selected destination",
+                );
+            }
+            paperless_cli::show_progress(
+                cli,
+                delivery::DeliveryEvent {
+                    phase: delivery::DeliveryPhase::Verifying,
+                    processed: 0,
+                    total: 1,
+                    delivered: 0,
+                    attention: 0,
+                },
+            );
             progress_line(cli, "Reconcile: verifying the selected existing original…");
             let item = delivery::reconcile_paperless(
                 &mut store,
@@ -121,6 +142,16 @@ pub(super) async fn run(cli: &Cli) -> Result<(Value, u8)> {
                 args.document_id,
             )
             .await?;
+            paperless_cli::show_progress(
+                cli,
+                delivery::DeliveryEvent {
+                    phase: delivery::DeliveryPhase::Finished,
+                    processed: 1,
+                    total: 1,
+                    delivered: 1,
+                    attention: 0,
+                },
+            );
             let report = json!({"delivered":0,"already_delivered":1,"items":[item]});
             Ok((
                 json!({"destinations":[{"name":args.destination,"kind":"paperless","delivery":report,"exit_code":0}],"reconciled":true}),
@@ -155,7 +186,10 @@ pub(super) async fn run(cli: &Cli) -> Result<(Value, u8)> {
                     )
                     .await
                 }
-                Err(error) => Err(error),
+                Err(error) => {
+                    reporter.finish_in_frontend(error.exit_code());
+                    Err(error)
+                }
             };
             let (mut report, mut code) = match result {
                 Ok((sync, code)) => (json!({"sync":sync,"sync_exit_code":code}), code),
@@ -315,24 +349,35 @@ async fn deliveries(cli: &Cli, args: &DeliveryArgs, audit: bool) -> Result<(Valu
     let selected = destinations::select(&store, &args.destinations)?;
     let mut rows = Vec::new();
     let mut code = 0;
-    for destination in selected {
+    let destination_count = selected.len();
+    for (index, destination) in selected.into_iter().enumerate() {
         if progress::stop_requested() {
             rows.push(json!({"name":destination.name,"kind":kind(&destination.kind),"error":"stopped before this destination"}));
             code = code.max(2);
             continue;
         }
         let name = &destination.name;
-        progress_line(
-            cli,
-            &format!(
-                "Destination {name}: {}…",
-                if audit {
-                    "auditing saved copies"
-                } else {
-                    "resuming delivery"
-                }
-            ),
+        let line = format!(
+            "Destination {name}: {}…",
+            if audit {
+                "auditing saved copies"
+            } else {
+                "resuming delivery"
+            }
         );
+        if progress_enabled(cli)
+            && !progress::publish_update(
+                progress::Telemetry::DestinationStarted {
+                    name: name.clone(),
+                    index: index + 1,
+                    total: destination_count,
+                    audit,
+                },
+                &line,
+            )
+        {
+            eprintln!("{line}");
+        }
         let options = DeliveryOptions {
             max_documents: args.limit as usize,
             poll_attempts: 31,
@@ -376,12 +421,12 @@ async fn deliveries(cli: &Cli, args: &DeliveryArgs, audit: bool) -> Result<(Valu
             DestinationKind::Folder { .. } => {
                 if audit {
                     delivery::verify_folder(&mut store, &destination, options, |e| {
-                        paperless_cli::show_progress(cli, e)
+                        paperless_cli::show_destination_progress(cli, e, "Folder")
                     })
                     .await
                 } else {
                     delivery::deliver_folder(&mut store, &destination, options, |e| {
-                        paperless_cli::show_progress(cli, e)
+                        paperless_cli::show_destination_progress(cli, e, "Folder")
                     })
                     .await
                 }
